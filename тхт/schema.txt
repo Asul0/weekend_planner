@@ -1,0 +1,258 @@
+from typing import Optional, List, Tuple, Dict, Any
+from pydantic import BaseModel, Field, validator
+from datetime import datetime
+from pydantic import (
+    BaseModel,
+    Field,
+    field_validator,
+)  # <--- Изменяем импорт для field_validator
+from typing import Optional, Any
+
+# --- Схемы для извлечения информации из запроса пользователя ---
+
+
+class ExtractedInitialInfo(BaseModel):
+    """Извлечённая из запроса информация пользователя (город, даты, интересы и т.д.)"""
+    city: Optional[str]
+    dates_description: Optional[str]
+    interests: Optional[List[str]] = Field(
+        None,
+        description="Список интересов или типов мероприятий (например, 'фильм', 'концерт', 'выставка', 'спектакль').",
+    )
+    budget: Optional[str] = None
+    raw_time_description: Optional[str] = None
+
+    @field_validator("interests", mode="before")
+    @classmethod
+    def interests_always_list(cls, v):
+        # Если interests пришло как строка — превращаем в список из одного элемента
+        if v is None:
+            return v
+        if isinstance(v, str):
+            return [v]
+        if isinstance(v, list):
+            return v
+        raise ValueError("interests must be a string or a list of strings")
+
+
+# --- Схемы для инструментов ---
+
+
+class DateTimeParserToolArgs(BaseModel):
+    """Аргументы для инструмента парсинга описания даты и времени на естественном языке."""  # <--- DOCSTRING
+
+    natural_language_date_time: str = Field(
+        description="Описание даты и/или времени на естественном языке (например, 'завтра в 7 вечера', 'через неделю', '15 июля')."
+    )
+    base_date_iso: Optional[str] = Field(
+        default=None,
+        description="ISO строка базовой даты для разрешения относительных дат, по умолчанию 'сегодня'.",
+    )
+
+
+class EventSearchToolArgs(BaseModel):
+    """
+    Аргументы для инструмента поиска мероприятий.
+    """
+
+    city_id: int = Field(
+        description="ID города (например, из API Афиши) для поиска мероприятий."
+    )
+    # Даты должны быть уже в datetime формате после работы datetime_parser_tool
+    date_from: datetime = Field(description="Дата начала периода поиска мероприятий.")
+    date_to: datetime = Field(description="Дата окончания периода поиска мероприятий.")
+    interests_keys: Optional[List[str]] = Field(
+        None,
+        description="Список ключей типов мероприятий (например, 'concert', 'movie') для API Афиши.",
+    )
+    min_start_time_naive: Optional[datetime] = Field(
+        None,
+        description="Минимальное время начала мероприятия (наивное, без таймзоны) для фильтрации.",
+    )
+    max_budget_per_person: Optional[int] = Field(
+        None,
+        description="Максимальный бюджет на человека для фильтрации мероприятий по цене.",
+    )
+    # Ограничения по времени, чтобы учесть уже запланированные мероприятия
+    # Например: {"start_after_naive": "YYYY-MM-DDTHH:MM:SS", "end_before_naive": "YYYY-MM-DDTHH:MM:SS"}
+    # Эти datetime должны быть наивными, в локальной таймзоне события/города
+    time_constraints_for_next_event: Optional[Dict[str, datetime]] = Field(
+        None,
+        description="Ограничения по времени для следующего мероприятия, если в плане уже есть другие.",
+    )
+    exclude_session_ids: Optional[List[int]] = Field(
+        None,
+        description="Список ID сессий мероприятий, которые нужно исключить из поиска.",
+    )
+
+
+class LocationModel(BaseModel):
+    address_string: Optional[str] = Field(default=None)
+    lon: Optional[float] = Field(default=None)
+    lat: Optional[float] = Field(default=None)
+
+    @field_validator(
+        "lon", "lat", mode="before", check_fields=False
+    )  # Используем field_validator и mode='before'
+    @classmethod  # Валидаторы полей должны быть classmethod или staticmethod, если не используют self
+    def check_coords_v2(
+        cls, v: Any, info: Any
+    ):  # info имеет тип FieldValidationInfo, но Any для простоты
+        # info.data содержит словарь всех полей модели ДО валидации этого поля (т.к. mode='before')
+        # v - это значение текущего поля (lon или lat)
+        # Нам нужно получить значения других полей из info.data
+
+        current_field_name = info.field_name  # Имя текущего поля ('lon' или 'lat')
+        data = (
+            info.data
+        )  # Словарь с данными модели, которые уже прошли или будут проходить валидацию
+
+        lon_val = data.get("lon") if current_field_name != "lon" else v
+        lat_val = data.get("lat") if current_field_name != "lat" else v
+        address_str_val = data.get("address_string")
+
+        # Если есть и lon, и lat, то все хорошо (v оставляем как есть)
+        if lon_val is not None and lat_val is not None:
+            return v
+
+        # Если нет координат, но есть адрес, это тоже допустимо (геокодируем позже)
+        if address_str_val:
+            return v  # или можно вернуть None, если хотим, чтобы координаты были только если они оба есть
+
+        # Если нет ни адреса, ни полной пары координат
+        # Этот случай более сложен с field_validator, так как он вызывается для каждого поля отдельно.
+        # Если мы хотим, чтобы модель была валидной, только если ЕСТЬ (адрес) ИЛИ (lon И lat),
+        # лучше использовать model_validator (root_validator в V1).
+        # Но для текущей логики "пропускаем, позволяя частичные координаты или только адрес",
+        # текущая проверка достаточна, так как она просто возвращает v.
+        # Если бы мы хотели выбросить ошибку при отсутствии адреса И отсутствии ПОЛНОЙ пары координат,
+        # то это лучше делать в @model_validator.
+
+        # Пока оставляем простую логику, что если нет адреса и нет полной пары, то
+        # значение поля v просто возвращается. Это может быть None.
+        return v
+
+
+class RouteBuilderToolArgs(BaseModel):
+    """
+    Аргументы для инструмента построения маршрута.
+    """
+
+    start_point: LocationModel = Field(
+        description="Начальная точка маршрута (адрес пользователя или предыдущее мероприятие)."
+    )
+    event_points: List[LocationModel] = Field(
+        description="Список точек мероприятий, которые нужно посетить."
+    )
+    transport_type: str = Field(
+        default="driving",
+        description="Тип транспорта: 'driving', 'walking', 'public_transport'.",
+    )
+
+
+# --- Схемы для объектов данных, используемых в AgentState ---
+
+
+class Event(BaseModel):
+    """
+    Информация о конкретном мероприятии.
+    """
+
+    session_id: int = Field(
+        description="Уникальный ID сеанса мероприятия, если есть (например, из API Афиши)."
+    )
+    afisha_id: Optional[str] = Field(
+        None, description="ID самого события в Афише (Creation ID)."
+    )
+    name: str = Field(description="Название мероприятия.")
+    event_type_key: str = Field(
+        description="Ключ типа мероприятия (например, 'Concert', 'Movie')."
+    )
+    place_name: str = Field(description="Название места проведения.")
+    place_address: Optional[str] = Field(None, description="Адрес места проведения.")
+    place_coords_lon: Optional[float] = Field(
+        None, description="Долгота места проведения."
+    )
+    place_coords_lat: Optional[float] = Field(
+        None, description="Широта места проведения."
+    )
+    start_time_iso: str = Field(
+        description="Время начала мероприятия в формате ISO строки с таймзоной."
+    )
+    start_time_naive_event_tz: datetime = Field(
+        description="Наивное время начала мероприятия в часовом поясе события."
+    )
+    duration_minutes: Optional[int] = Field(
+        None, description="Продолжительность мероприятия в минутах."
+    )
+    min_price: Optional[int] = Field(None, description="Минимальная цена билета.")
+    price_text: Optional[str] = Field(None, description="Текстовое представление цены.")
+    # Дополнительные поля из вашего afisha_service.py можно добавить сюда по необходимости
+    # "duration_description": original_creation.get("DurationDescription"),
+    # "rating": original_creation.get("Rating"),
+    # "age_restriction": original_creation.get("AgeRestriction"),
+    # "raw_creation": original_creation,
+    # "raw_session": session_info,
+    # "raw_place": place_info,
+
+
+class RouteDetails(BaseModel):
+    """
+    Детали построенного маршрута.
+    """
+
+    status: str = Field(
+        description="Статус построения маршрута ('success', 'error', 'api_error', etc.)."
+    )
+    duration_seconds: Optional[int] = Field(
+        None, description="Общая длительность маршрута в секундах."
+    )
+    duration_text: Optional[str] = Field(
+        None,
+        description="Текстовое представление общей длительности (например, '~25 мин').",
+    )
+    distance_meters: Optional[int] = Field(
+        None, description="Общее расстояние маршрута в метрах."
+    )
+    distance_text: Optional[str] = Field(
+        None,
+        description="Текстовое представление общего расстояния (например, '~5 км').",
+    )
+    # Можно добавить сюда детальные шаги маршрута, если API 2GIS их возвращает и они нужны
+    # segments: Optional[List[Dict[str, Any]]] = Field(None, description="Сегменты маршрута с инструкциями.")
+    error_message: Optional[str] = Field(
+        None, description="Сообщение об ошибке, если status не 'success'."
+    )
+
+
+class ParsedDateTime(BaseModel):
+    """
+    Структурированный результат парсинга описания даты и времени.
+    Содержит компоненты даты и времени, флаг неоднозначности и возможные уточнения или ошибки.
+    """  # <--- ДОБАВЛЕН DOCSTRING
+
+    year: Optional[int] = Field(default=None, description="Год")
+    month: Optional[int] = Field(default=None, description="Месяц (число от 1 до 12)")
+    day: Optional[int] = Field(default=None, description="День месяца")
+    hour: Optional[int] = Field(default=None, description="Час (от 0 до 23)")
+    minute: Optional[int] = Field(default=None, description="Минута")
+    is_ambiguous: bool = Field(
+        default=False,
+        description="True, если дата/время неполная или неоднозначная и требует уточнения.",
+    )
+    clarification_needed: Optional[str] = Field(
+        default=None, description="Текст запроса на уточнение, если is_ambiguous=True."
+    )
+    error_message: Optional[str] = Field(
+        default=None, description="Сообщение об ошибке, если не удалось распознать."
+    )
+
+
+class AnalyzedFeedback(BaseModel):  # Убедитесь, что имя класса ТОЧНО AnalyzedFeedback
+    intent_type: str = Field(
+        description="Тип намерения пользователя: 'confirm_plan' (план подтвержден), 'request_change' (запрос на изменение), 'clarify_misunderstanding' (пользователь не понял или просит уточнения от агента), 'new_search' (пользователь хочет начать новый поиск с другими критериями)."
+    )
+    change_details: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Словарь с деталями запрошенного изменения, если intent_type='request_change'. Ключи и значения зависят от типа изменения. Например: {'target': 'budget', 'value': 2000} или {'target': 'event', 'event_index': 1, 'action': 'replace', 'new_interest': 'театр'} или {'target': 'date', 'new_value': '15 июля'}.",
+    )
