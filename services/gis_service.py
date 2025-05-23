@@ -242,4 +242,4 @@ async def get_route(
             "status": "unknown_error",
             "message": f"Неизвестная ошибка при построении маршрута через 2GIS: {e}",
         }
-async def get_route(
+
