@@ -70,36 +70,94 @@ logger = logging.getLogger(__name__)
 async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: extract_initial_info_node executing...")
     messages = state.get("messages", [])
-    # 1. Инициализация collected_data
-    if "collected_data" not in state or state["collected_data"] is None:
-        collected_data_state: CollectedUserData = CollectedUserData()
-    else:
-        collected_data_state = state["collected_data"]
 
-    # 2. Проверяем, что последнее сообщение — HumanMessage (новый пользовательский ввод)
+    # Всегда работаем с копией, чтобы изменения были локальны до возврата
+    current_collected_data: CollectedUserData = dict(state.get("collected_data", {}))  # type: ignore
+
     if not messages or not isinstance(messages[-1], HumanMessage):
         logger.debug(
-            "extract_initial_info_node: Last message is not HumanMessage or no messages. No new extraction will be performed."
+            "extract_initial_info_node: No new HumanMessage. Returning current state."
         )
         return {
-            "collected_data": collected_data_state,
+            "collected_data": current_collected_data,  # Возвращаем ту же копию, если ничего не делали
             "messages": messages,
             "clarification_context": state.get("clarification_context"),
-            "status_message_to_user": state.get("status_message_to_user"),
         }
 
-    # 3. Начинаем разбор нового сообщения пользователя
-    logger.info(
-        f"extract_initial_info_node: Processing new HumanMessage: '{messages[-1].content}'"
-    )
-    collected_data_state["clarification_needed_fields"] = []
-    clarification_context_for_current_step = None
     user_query = messages[-1].content
+    is_reply_to_address_request = current_collected_data.get(
+        "awaiting_address_input", False
+    )
+
+    logger.info(
+        f"extract_initial_info_node: Processing HumanMessage: '{user_query}'. Is reply to address request: {is_reply_to_address_request}"
+    )
+    logger.debug(
+        f"extract_initial_info_node: Initial collected_data state: {current_collected_data}"
+    )
+
+    current_clarification_context = None
+    current_collected_data["clarification_needed_fields"] = []  # type: ignore # Всегда сбрасываем в начале обработки нового сообщения
+
+    if is_reply_to_address_request:
+        logger.info(f"Input '{user_query}' is being treated as an address.")
+        # Город ДОЛЖЕН уже быть в current_collected_data
+        city_for_geocoding = current_collected_data.get("city_name")
+
+        if not city_for_geocoding:
+            logger.error(
+                "extract_initial_info_node: City name missing in collected_data while expecting address input."
+            )
+            current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
+            if "awaiting_address_input" in current_collected_data:
+                del current_collected_data["awaiting_address_input"]  # type: ignore
+        else:
+            coords = await get_coords_from_address(
+                address=user_query, city=city_for_geocoding
+            )
+            if coords:
+                current_collected_data["user_start_address_original"] = user_query
+                current_collected_data["user_start_address_validated_coords"] = {
+                    "lon": coords[0],
+                    "lat": coords[1],
+                }
+                logger.info(
+                    f"Address '{user_query}' geocoded to {coords} in city '{city_for_geocoding}'."
+                )
+                if "awaiting_address_input" in current_collected_data:
+                    del current_collected_data["awaiting_address_input"]  # type: ignore
+            else:
+                logger.warning(
+                    f"Could not geocode address '{user_query}' in city '{city_for_geocoding}'. Requesting clarification for address."
+                )
+                if "user_start_address_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
+                    current_collected_data.setdefault("clarification_needed_fields", []).append("user_start_address_original")  # type: ignore
+                # Флаг awaiting_address_input остается True
+                current_clarification_context = "Не удалось распознать этот адрес. Пожалуйста, попробуйте ввести его еще раз (улица и номер дома) или укажите другой."
+
+        logger.debug(
+            f"extract_initial_info_node: collected_data after address processing: {current_collected_data}"
+        )
+        return {
+            "collected_data": current_collected_data,
+            "messages": messages,
+            "clarification_context": current_clarification_context,
+        }
+
+    # Если НЕ ответ на запрос адреса, то полный разбор LLM
+    prev_city_name = current_collected_data.get("city_name")
+    prev_city_id_afisha = current_collected_data.get("city_id_afisha")
+    prev_dates_desc = current_collected_data.get("dates_description_original")
+    prev_parsed_dates = current_collected_data.get("parsed_dates_iso")
+    prev_interests_orig = current_collected_data.get("interests_original")
+    prev_interests_keys = current_collected_data.get("interests_keys_afisha")
+    # Бюджет и user_start_address могут быть перезаписаны, если LLM их извлечет
+
     llm = get_gigachat_client()
     structured_llm = llm.with_structured_output(ExtractedInitialInfo)
     try:
         logger.debug(
-            f"extract_initial_info_node: Querying LLM for initial info from: '{user_query}'"
+            f"extract_initial_info_node: Querying LLM for general info from: '{user_query}'"
         )
         extraction_prompt_with_query = f'{INITIAL_INFO_EXTRACTION_PROMPT}\n\nИзвлеки информацию из следующего запроса пользователя:\n"{user_query}"'
         extracted_info: ExtractedInitialInfo = await structured_llm.ainvoke(
@@ -109,41 +167,25 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
             f"extract_initial_info_node: LLM Extracted Info: {extracted_info.model_dump_json(indent=2)}"
         )
 
-        # --- Город ---
+        # Город: обновляем только если LLM извлек новый город
         if extracted_info.city:
-            city_changed = (
-                not collected_data_state.get("city_name")
-                or collected_data_state.get("city_name", "").lower()
-                != extracted_info.city.lower()
-            )
-            if city_changed:
-                collected_data_state["city_name"] = extracted_info.city
-                cities_from_afisha = await fetch_cities_internal()
-                found_city_afisha = next(
-                    (
-                        c
-                        for c in cities_from_afisha
-                        if extracted_info.city.lower() in c["name_lower"]
-                    ),
-                    None,
-                )
-                if found_city_afisha:
-                    collected_data_state["city_id_afisha"] = found_city_afisha["id"]
-                else:
-                    collected_data_state["city_id_afisha"] = None
-                    collected_data_state.setdefault(
-                        "clarification_needed_fields", []
-                    ).append("city_name")
-        elif not collected_data_state.get("city_name"):
-            collected_data_state.setdefault("clarification_needed_fields", []).append(
-                "city_name"
-            )
+            current_collected_data["city_name"] = extracted_info.city
+            cities_from_afisha = await fetch_cities_internal()
+            found_city_afisha = next((c for c in cities_from_afisha if extracted_info.city.lower() in c["name_lower"]), None)  # type: ignore
+            if found_city_afisha:
+                current_collected_data["city_id_afisha"] = found_city_afisha["id"]  # type: ignore
+            else:
+                current_collected_data["city_id_afisha"] = None  # type: ignore
+                current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
+        elif prev_city_name:  # Если LLM не вернул город, а он был, используем старый
+            current_collected_data["city_name"] = prev_city_name
+            current_collected_data["city_id_afisha"] = prev_city_id_afisha  # type: ignore
+        elif not current_collected_data.get("city_name"):  # Если города нет и не было
+            current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
 
-        # --- Даты ---
+        # Даты: обновляем, если LLM извлек новое описание дат
         if extracted_info.dates_description:
-            collected_data_state["dates_description_original"] = (
-                extracted_info.dates_description
-            )
+            current_collected_data["dates_description_original"] = extracted_info.dates_description  # type: ignore
             current_date_iso = datetime.now().isoformat()
             parsed_date_time_result = await datetime_parser_tool.ainvoke(
                 {
@@ -151,32 +193,24 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                     "base_date_iso": current_date_iso,
                 }
             )
-            logger.info(
-                f"extract_initial_info_node: DateTimeParserTool result: {parsed_date_time_result}"
-            )
             if parsed_date_time_result.get("datetime_iso"):
-                collected_data_state["parsed_dates_iso"] = [
-                    parsed_date_time_result["datetime_iso"]
-                ]
+                current_collected_data["parsed_dates_iso"] = [parsed_date_time_result["datetime_iso"]]  # type: ignore
                 if parsed_date_time_result.get("is_ambiguous"):
-                    collected_data_state.setdefault(
-                        "clarification_needed_fields", []
-                    ).append("dates_description_original")
-                    clarification_context_for_current_step = (
-                        parsed_date_time_result.get("clarification_needed")
+                    current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
+                    current_clarification_context = parsed_date_time_result.get(
+                        "clarification_needed"
                     )
-            elif not collected_data_state.get("parsed_dates_iso"):
-                collected_data_state.setdefault(
-                    "clarification_needed_fields", []
-                ).append("dates_description_original")
-        elif not collected_data_state.get("parsed_dates_iso"):
-            collected_data_state.setdefault("clarification_needed_fields", []).append(
-                "dates_description_original"
-            )
+            elif not current_collected_data.get("parsed_dates_iso") and not prev_parsed_dates:  # type: ignore
+                current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
+        elif prev_dates_desc:  # Если LLM не вернул даты, а они были, используем старые
+            current_collected_data["dates_description_original"] = prev_dates_desc  # type: ignore
+            current_collected_data["parsed_dates_iso"] = prev_parsed_dates  # type: ignore
+        elif not current_collected_data.get("parsed_dates_iso"):  # Дат нет и не было
+            current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
 
-        # --- Интересы ---
+        # Интересы: обновляем, если LLM извлек новые интересы
         if extracted_info.interests:
-            collected_data_state["interests_original"] = extracted_info.interests
+            current_collected_data["interests_original"] = extracted_info.interests  # type: ignore
             mapped_interest_keys = []
             for interest_str in extracted_info.interests:
                 key = None
@@ -192,64 +226,63 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                 if not key:
                     key = interest_str.capitalize()
                 mapped_interest_keys.append(key)
-            collected_data_state["interests_keys_afisha"] = list(
-                set(mapped_interest_keys)
-            )
-        elif not collected_data_state.get("interests_keys_afisha"):
-            collected_data_state.setdefault("clarification_needed_fields", []).append(
-                "interests_original"
-            )
+            current_collected_data["interests_keys_afisha"] = list(set(mapped_interest_keys))  # type: ignore
+        elif (
+            prev_interests_orig
+        ):  # Если LLM не вернул интересы, а они были, используем старые
+            current_collected_data["interests_original"] = prev_interests_orig  # type: ignore
+            current_collected_data["interests_keys_afisha"] = prev_interests_keys  # type: ignore
+        elif not current_collected_data.get(
+            "interests_keys_afisha"
+        ):  # Интересов нет и не было
+            current_collected_data.setdefault("clarification_needed_fields", []).append("interests_original")  # type: ignore
 
-        # --- Бюджет ---
-        if extracted_info.budget is not None:
-            collected_data_state["budget_original"] = extracted_info.budget
-            collected_data_state["budget_current_search"] = extracted_info.budget
+        if extracted_info.budget is not None:  # Бюджет может быть просто обновлен
+            current_collected_data["budget_original"] = extracted_info.budget  # type: ignore
+            current_collected_data["budget_current_search"] = extracted_info.budget  # type: ignore
 
-        # --- Сырые временные описания (если есть) ---
-        if extracted_info.raw_time_description:
-            if not collected_data_state.get("dates_description_original"):
-                collected_data_state["dates_description_original"] = (
-                    extracted_info.raw_time_description
-                )
-            collected_data_state["raw_time_description_original"] = (
-                extracted_info.raw_time_description
-            )
-            if not clarification_context_for_current_step:
-                clarification_context_for_current_step = f"Пользователь указал время как '{extracted_info.raw_time_description}'. Уточните, пожалуйста, время."
-            collected_data_state.setdefault("clarification_needed_fields", []).append(
+        if (
+            extracted_info.raw_time_description
+        ):  # raw_time_description также может быть просто обновлен
+            if not current_collected_data.get(
                 "dates_description_original"
-            )
+            ):  # Но только если dates_description не был извлечен более явно
+                current_collected_data["dates_description_original"] = extracted_info.raw_time_description  # type: ignore
+            current_collected_data["raw_time_description_original"] = extracted_info.raw_time_description  # type: ignore
+            if (
+                not current_clarification_context
+            ):  # Устанавливаем контекст, только если не было более специфичного от парсера дат
+                current_clarification_context = f"Пользователь указал время как '{extracted_info.raw_time_description}'. Уточните, пожалуйста, время."
+            if "dates_description_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
+                current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
 
     except Exception as e:
         logger.error(
             f"extract_initial_info_node: Critical error during LLM call or info processing: {e}",
             exc_info=True,
         )
-        # Если ошибка, запросить ВСЕ
-        for f in ["city_name", "dates_description_original", "interests_original"]:
-            if f not in collected_data_state.get("clarification_needed_fields", []):
-                collected_data_state.setdefault(
-                    "clarification_needed_fields", []
-                ).append(f)
+        for f_key in ["city_name", "dates_description_original", "interests_original"]:
+            if not current_collected_data.get(f_key):  # type: ignore
+                if f_key not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
+                    current_collected_data.setdefault("clarification_needed_fields", []).append(f_key)  # type: ignore
 
-    # Очищаем дубли в clarification_needed_fields
-    if "clarification_needed_fields" in collected_data_state:
-        fields = collected_data_state["clarification_needed_fields"]
-        collected_data_state["clarification_needed_fields"] = list(
-            dict.fromkeys([f for f in fields if f])
-        )
+    if "clarification_needed_fields" in current_collected_data and current_collected_data.get("clarification_needed_fields"):  # type: ignore
+        fields_list = current_collected_data["clarification_needed_fields"]  # type: ignore
+        current_collected_data["clarification_needed_fields"] = list(dict.fromkeys([f_item for f_item in fields_list if f_item]))  # type: ignore
+        if not current_collected_data.get("clarification_needed_fields"):  # type: ignore
+            del current_collected_data["clarification_needed_fields"]  # type: ignore
 
     logger.info(
-        f"extract_initial_info_node: Final collected_data after extraction: {str(collected_data_state)[:500]}"
+        f"extract_initial_info_node: Final collected_data after extraction: {str(current_collected_data)[:500]}"
     )
     logger.info(
-        f"extract_initial_info_node: Clarification needed for after extraction: {collected_data_state.get('clarification_needed_fields')}"
+        f"extract_initial_info_node: Clarification needed for after extraction: {current_collected_data.get('clarification_needed_fields')}"
     )
 
     return {
-        "collected_data": collected_data_state,
+        "collected_data": current_collected_data,
         "messages": messages,
-        "clarification_context": clarification_context_for_current_step,
+        "clarification_context": current_clarification_context,
     }
 
 
@@ -585,13 +618,11 @@ async def search_events_node(state: AgentState) -> Dict[str, Any]:
 async def present_initial_plan_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: present_initial_plan_node executing...")
     current_events = state.get("current_events")
-    collected_data: CollectedUserData = state.get("collected_data", {})  # type: ignore
+    # Получаем копию, чтобы изменения точно отразились в возвращаемом словаре
+    collected_data: CollectedUserData = dict(state.get("collected_data", {}))  # type: ignore
 
     if not current_events:
         logger.warning("present_initial_plan_node: No current events to present.")
-        # Это состояние не должно достигаться, если search_events_node вернул пустой список
-        # и условный переход направил на error_node.
-        # Но на всякий случай, если мы сюда попали.
         return {
             "status_message_to_user": "Кажется, мероприятий для предложения нет. Попробуем снова?"
         }
@@ -606,52 +637,50 @@ async def present_initial_plan_node(state: AgentState) -> Dict[str, Any]:
         event_descriptions.append(desc)
 
     plan_text = "Вот что я смог найти для вас:\n" + "\n".join(event_descriptions)
-
     questions_to_user = []
-    # Запрос начальной точки, если она еще неизвестна
+
+    # Сбрасываем флаг перед проверкой, чтобы избежать ложного срабатывания, если он остался от предыдущего шага
+    if "awaiting_address_input" in collected_data:
+        del collected_data["awaiting_address_input"]  # type: ignore
+
     if not collected_data.get("user_start_address_original") and not collected_data.get(
         "user_start_address_validated_coords"
     ):
         questions_to_user.append(
             "Откуда вы планируете начать маршрут? Назовите, пожалуйста, адрес (улица и дом)."
         )
-        collected_data.setdefault("clarification_needed_fields", []).append("user_start_address_original")  # type: ignore
+        collected_data["awaiting_address_input"] = True  # type: ignore
+        # Убираем user_start_address_original из clarification_needed_fields, так как мы сейчас его запросим через awaiting_address_input
+        if "clarification_needed_fields" in collected_data and collected_data.get("clarification_needed_fields"):  # type: ignore
+            collected_data["clarification_needed_fields"] = [  # type: ignore
+                f for f in collected_data["clarification_needed_fields"] if f != "user_start_address_original"  # type: ignore
+            ]
+            if not collected_data.get("clarification_needed_fields"):  # type: ignore
+                del collected_data["clarification_needed_fields"]  # type: ignore
 
-    # Опциональный запрос бюджета, если он не был указан и еще не спрашивали
-    # (или если хотим уточнить после первого поиска)
     if (
         collected_data.get("budget_current_search") is None
         and collected_data.get("budget_original") is None
     ):
-        # Можно добавить флаг is_budget_clarified в AgentState, чтобы не спрашивать повторно, если уже отказались.
         questions_to_user.append(
             "Кстати, чтобы лучше подобрать варианты в будущем или если эти не совсем подойдут, уточните, какой у вас примерный бюджет на одно мероприятие?"
         )
-        # Не помечаем для уточнения, так как это опционально
 
     if questions_to_user:
         plan_text += "\n\n" + " ".join(questions_to_user)
     else:
-        # Если адрес и бюджет уже есть (или бюджет не нужен), можно сразу перейти к построению маршрута
-        # или к запросу подтверждения, если маршрут не строится для одного мероприятия без адреса.
-        # Пока просто предлагаем план. Логика маршрута будет в следующем узле.
         plan_text += "\n\nКак вам такой предварительный план?"
 
-    # Очищаем clarification_needed_fields, если они были только для адреса/бюджета и мы их задали
-    if "clarification_needed_fields" in collected_data:
-        collected_data["clarification_needed_fields"] = [  # type: ignore
-            f for f in collected_data.get("clarification_needed_fields", []) if f not in ["user_start_address_original"]  # type: ignore
-        ]
-        if not collected_data["clarification_needed_fields"]:  # type: ignore
-            del collected_data["clarification_needed_fields"]  # type: ignore
-
+    logger.debug(
+        f"present_initial_plan_node: collected_data before return: {collected_data}"
+    )
     new_messages = state.get("messages", []) + [AIMessage(content=plan_text)]  # type: ignore
 
     return {
         "messages": new_messages,
         "status_message_to_user": plan_text,
-        "collected_data": collected_data,
-        "is_initial_plan_proposed": True,  # Подтверждаем, что начальный план предложен
+        "collected_data": collected_data,  # Убеждаемся, что возвращаем измененный collected_data
+        "is_initial_plan_proposed": True,
     }
 
 
@@ -662,9 +691,10 @@ from tools.route_builder_tool import route_builder_tool  # Наш инструм
 
 
 # --- Узел 5: Обработка ответа на адрес ИЛИ построение маршрута, если адрес не нужен / уже есть ---
-async def clarify_address_or_build_route_node(
-    state: AgentState,
-) -> Dict[str, Any]:  # Можете переименовать в build_route_node для ясности
+# agent_core/nodes.py
+
+
+async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, Any]:
     logger.info(
         "Node: build_route_node (formerly clarify_address_or_build_route_node) executing..."
     )
@@ -674,19 +704,17 @@ async def clarify_address_or_build_route_node(
 
     if not current_events:
         logger.warning("build_route_node: No current events, cannot build route.")
-        # Возвращаем ошибку, чтобы present_full_plan_node мог ее отобразить
         return {
             "current_route_details": RouteDetails(
                 status="error", error_message="Нет мероприятий для построения маршрута."
             ),
-            "is_full_plan_with_route_proposed": False,  # Технически план будет, но без маршрута и с ошибкой
+            "is_full_plan_with_route_proposed": False,
         }
 
     if len(current_events) == 1 and not user_start_coords:
         logger.info(
             "build_route_node: One event and no user address, route not built as per logic."
         )
-        # Возвращаем None или специальный статус, чтобы present_full_plan_node знал, что маршрут не строился
         return {
             "current_route_details": None,
             "is_full_plan_with_route_proposed": False,
@@ -710,9 +738,7 @@ async def clarify_address_or_build_route_node(
                 lat=first_event.place_coords_lat,
                 address_string=first_event.place_address,
             )
-        elif (
-            first_event.place_address
-        ):  # Попытка геокодировать адрес первого события, если нет координат
+        elif first_event.place_address:
             city_for_geocoding = collected_data.get("city_name", "")
             coords = await get_coords_from_address(
                 address=first_event.place_address, city=city_for_geocoding
@@ -745,7 +771,7 @@ async def clarify_address_or_build_route_node(
                 ),
                 "is_full_plan_with_route_proposed": False,
             }
-    else:  # Менее 2х событий и нет адреса пользователя
+    else:
         logger.info(
             "build_route_node: Not enough points for routing and no user_start_address."
         )
@@ -800,9 +826,7 @@ async def clarify_address_or_build_route_node(
             "is_full_plan_with_route_proposed": False,
         }
 
-    if (
-        not event_points_for_api and len(events_to_route) > 0
-    ):  # Если были события для маршрута, но ни для одного не удалось получить точки
+    if not event_points_for_api and len(events_to_route) > 0:
         logger.error(
             "build_route_node: No valid event points with coordinates to build a route to."
         )
@@ -814,23 +838,20 @@ async def clarify_address_or_build_route_node(
             "is_full_plan_with_route_proposed": False,
         }
 
-    if (
-        not event_points_for_api
-    ):  # Если нет точек назначения (например, только одно событие от адреса пользователя)
+    if not event_points_for_api and start_location_for_api:
         logger.info(
-            "build_route_node: No event points to route to (e.g., single event from user address or route between events with only one valid)."
+            "build_route_node: Only a single start point, no event points to route to. Route is trivial."
         )
-        # Это может быть нормальным для одного события от адреса пользователя.
-        # Возвращаем "успех", но с нулевой длительностью, present_full_plan_node это обработает.
         return {
             "current_route_details": RouteDetails(
                 status="success",
-                duration_seconds=0,
-                duration_text="0 мин",
-                distance_meters=0,
-                distance_text="0 км",
+                segments=[],
+                total_duration_seconds=0,
+                total_duration_text="0 мин",
+                total_distance_meters=0,
+                total_distance_text="0 км",
             ),
-            "is_full_plan_with_route_proposed": True,  # Маршрут (пустой) "построен"
+            "is_full_plan_with_route_proposed": True,
         }
 
     tool_args = RouteBuilderToolArgs(
@@ -839,43 +860,50 @@ async def clarify_address_or_build_route_node(
     logger.info(
         f"build_route_node: Calling route_builder_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
     )
+
     route_data_dict = await route_builder_tool.ainvoke(
         tool_args.model_dump(exclude_none=True)
     )
 
     try:
         route_details_obj = RouteDetails(**route_data_dict)
-        if route_details_obj.status == "success":
+
+        if (
+            route_details_obj.status == "success"
+            or route_details_obj.status == "partial_success"
+        ):
             logger.info(
-                f"build_route_node: Route successfully built. Duration: {route_details_obj.duration_text}"
+                f"build_route_node: Route building process finished. Status: {route_details_obj.status}. Total Duration: {route_details_obj.total_duration_text}"
             )
         else:
             logger.error(
-                f"build_route_node: Route building failed by tool. Status: {route_details_obj.status}, Msg: {route_details_obj.error_message}"
+                f"build_route_node: Route building failed. Status: {route_details_obj.status}, Msg: {route_details_obj.error_message}"
             )
-        # is_full_plan_with_route_proposed будет True, если status="success"
+
         return {
-            "current_route_details": route_details_obj,
-            "is_full_plan_with_route_proposed": route_details_obj.status == "success",
+            "current_route_details": route_details_obj,  # Возвращаем ОБЪЕКТ RouteDetails
+            "is_full_plan_with_route_proposed": route_details_obj.status
+            in ["success", "partial_success"],
         }
     except ValidationError as ve:
         logger.error(
-            f"build_route_node: Validation error for route_data: {route_data_dict}. Error: {ve}"
+            f"build_route_node: Validation error for route_data returned by tool: {route_data_dict}. Error: {ve}"
         )
         return {
             "current_route_details": RouteDetails(
-                status="error", error_message="Ошибка при обработке данных маршрута."
+                status="error",
+                error_message="Ошибка при обработке данных маршрута от инструмента.",
             ),
             "is_full_plan_with_route_proposed": False,
         }
-
 
 
 # --- Узел 6: Представление полного плана (мероприятия + маршрут) ---
 async def present_full_plan_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: present_full_plan_node executing...")
     current_events: Optional[List[Event]] = state.get("current_events")
-    current_route: Optional[RouteDetails] = state.get("current_route_details")
+    # current_route_details теперь будет объектом RouteDetails
+    current_route_details_obj: Optional[RouteDetails] = state.get("current_route_details")  # type: ignore
 
     if not current_events:
         logger.warning("present_full_plan_node: No current events to present.")
@@ -895,49 +923,89 @@ async def present_full_plan_node(state: AgentState) -> Dict[str, Any]:
             desc += f"\n   Цена: {event.price_text}"
         response_parts.append(desc)
 
-    if current_route and current_route.status == "success":
-        response_parts.append("\nМаршрут:")
-        if current_route.duration_text and current_route.distance_text:
-            response_parts.append(
-                f"  Общее время в пути: {current_route.duration_text}, расстояние: {current_route.distance_text}."
-            )
-        else:  # Если только одно мероприятие и маршрут "нулевой"
-            response_parts.append("  Вы уже на месте или маршрут не требуется.")
+    if current_route_details_obj:
+        if (
+            current_route_details_obj.status == "success"
+            or current_route_details_obj.status == "partial_success"
+        ):
+            if (
+                current_route_details_obj.segments
+                and len(current_route_details_obj.segments) > 0
+            ):
+                response_parts.append("\nМаршрут:")
+                for idx, segment in enumerate(current_route_details_obj.segments):
+                    from_name = segment.from_address or f"Точка {idx+1}"
+                    to_name = segment.to_address or f"Точка {idx+2}"
+                    segment_text = f"  {idx+1}. От '{from_name}' до '{to_name}': "
+                    if segment.segment_status == "success":
+                        segment_text += f"{segment.duration_text or '? мин'}, {segment.distance_text or '? км'}."
+                    else:
+                        segment_text += f"не удалось построить ({segment.segment_error_message or 'причина неизвестна'})."
+                    response_parts.append(segment_text)
 
-    elif current_route and current_route.status != "success":
-        response_parts.append(
-            f"\nМаршрут: Не удалось построить ({current_route.error_message or 'причина неизвестна'})."
-        )
-    elif (
-        not current_route and len(current_events) > 1
-    ):  # Маршрут должен был быть, но его нет
-        response_parts.append(
-            "\nМаршрут: Построение маршрута не удалось или не запрашивалось для одной точки."
-        )
-    elif (
-        not current_route
-        and len(current_events) == 1
-        and not state.get("collected_data", {}).get(
-            "user_start_address_validated_coords"
-        )
-    ):
-        response_parts.append(
-            "\nМаршрут: Не указан адрес отправления, поэтому маршрут до мероприятия не построен."
-        )
+                if (
+                    current_route_details_obj.total_duration_text
+                    and current_route_details_obj.total_distance_text
+                    and len(current_route_details_obj.segments) > 1
+                ):
+                    response_parts.append(
+                        f"\n  Общее время в пути по построенным сегментам: {current_route_details_obj.total_duration_text}, общее расстояние: {current_route_details_obj.total_distance_text}."
+                    )
+                elif current_route_details_obj.status == "partial_success":
+                    response_parts.append(
+                        "\n  Не все части маршрута удалось построить."
+                    )
+
+            elif (
+                current_route_details_obj.total_duration_seconds == 0
+                and not current_route_details_obj.segments
+            ):  # Маршрут не нужен (1 точка)
+                response_parts.append("\nМаршрут: одна точка, маршрут не требуется.")
+            else:  # Успех, но нет сегментов - странно, но обрабатываем
+                response_parts.append(
+                    "\nМаршрут: построен, но детали сегментов отсутствуют."
+                )
+
+        elif (
+            current_route_details_obj.status != "success"
+        ):  # Например, status == "error"
+            response_parts.append(
+                f"\nМаршрут: Не удалось построить ({current_route_details_obj.error_message or 'причина неизвестна'})."
+            )
+
+    elif not current_route_details_obj:  # Если current_route_details вообще None
+        if (
+            current_events
+            and len(current_events) > 1
+            and state.get("collected_data", {}).get(
+                "user_start_address_validated_coords"
+            )
+        ):
+            response_parts.append(
+                "\nМаршрут: Построение маршрута не выполнялось или произошла ошибка до его формирования."
+            )
+        elif (
+            current_events
+            and len(current_events) == 1
+            and not state.get("collected_data", {}).get(
+                "user_start_address_validated_coords"
+            )
+        ):
+            response_parts.append(
+                "\nМаршрут: Не указан адрес отправления, поэтому маршрут до мероприятия не построен."
+            )
 
     response_parts.append(
         "\n\nКак вам такой план? Можем что-то изменить, добавить, убрать или подобрать другие варианты с учетом бюджета/количества людей, если вы их уточните?"
     )
-
     full_plan_text = "\n".join(response_parts)
-
     new_messages = state.get("messages", []) + [AIMessage(content=full_plan_text)]  # type: ignore
 
     return {
         "messages": new_messages,
         "status_message_to_user": full_plan_text,
-        "awaiting_final_confirmation": True,  # Ожидаем подтверждения
-        "is_full_plan_with_route_proposed": True,  # Флаг, что полный план предложен
+        "awaiting_final_confirmation": True,
+        "is_full_plan_with_route_proposed": True,
     }
 
 
