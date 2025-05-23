@@ -116,8 +116,8 @@ async def get_route(
             return {"status": "error", "message": msg}
         formatted_points.append(
             {
-                "x": p_val["lon"],
-                "y": p_val["lat"],
+                "lon": p_val["lon"],
+                "lat": p_val["lat"],
                 "type": ("pedo" if transport == "walking" else "auto"),
             }
         )
