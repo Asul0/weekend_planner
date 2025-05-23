@@ -34,15 +34,11 @@ def create_agent_graph() -> StateGraph:
     logger.info("Creating agent graph...")
     graph_builder = StateGraph(AgentState)
 
-    # --- Добавление узлов ---
-    # (остается как есть)
     graph_builder.add_node("extract_initial_info", extract_initial_info_node)
     graph_builder.add_node("clarify_missing_data", clarify_missing_data_node)
     graph_builder.add_node("search_events", search_events_node)
     graph_builder.add_node("present_initial_plan", present_initial_plan_node)
-    graph_builder.add_node(
-        "clarify_address_or_build_route", clarify_address_or_build_route_node
-    )
+    graph_builder.add_node("build_route", clarify_address_or_build_route_node)
     graph_builder.add_node("present_full_plan", present_full_plan_node)
     graph_builder.add_node("handle_plan_feedback", handle_plan_feedback_node)
     graph_builder.add_node("confirm_changes", confirm_changes_node)
@@ -52,69 +48,45 @@ def create_agent_graph() -> StateGraph:
     graph_builder.set_entry_point("extract_initial_info")
     logger.info("Entry point set to 'extract_initial_info'.")
 
-    # --- Рёбра ---
-
-    # 1. От извлечения начальной информации
     graph_builder.add_conditional_edges(
         "extract_initial_info",
-        check_initial_data_sufficiency_edge,  # Этот эдж должен вернуть "clarify_missing_data" или "search_events"
+        check_initial_data_sufficiency_edge,
         {
-            "clarify_missing_data_node": "clarify_missing_data",  # Переименовал для ясности
+            "clarify_missing_data_node": "clarify_missing_data",
             "search_events_node": "search_events",
+            "build_route_node": "build_route",
+            END: END,
         },
     )
 
-    # 3. От поиска мероприятий
     graph_builder.add_conditional_edges(
         "search_events",
-        check_event_search_result_edge,  # Возвращает "present_initial_plan" или "error_handler"
+        check_event_search_result_edge,
         {
-            "present_initial_plan_node": "present_initial_plan",  # Переименовал
-            "error_node": "error_handler",  # Переименовал
+            "present_initial_plan_node": "present_initial_plan",
+            "error_node": "error_handler",
         },
     )
 
-    graph_builder.add_edge("present_initial_plan", "clarify_address_or_build_route")
+    graph_builder.add_edge("clarify_missing_data", END)
+    graph_builder.add_edge("present_initial_plan", END)
+    graph_builder.add_edge("error_handler", END)
 
-    graph_builder.add_conditional_edges(
-        "clarify_address_or_build_route",
-        lambda state: "clarify_missing_data" if state.get("collected_data", {}).get("clarification_needed_fields") and "user_start_address_original" in state.get("collected_data", {}).get("clarification_needed_fields", []) else "present_full_plan",  # type: ignore
-        {
-            "clarify_missing_data": "clarify_missing_data",  # Если clarify_address_or_build_route решил, что адрес нужно УТОЧНИТЬ
-            "present_full_plan": "present_full_plan",  # Если адрес есть/получен, или маршрут не нужен/построен
-        },
-    )
+    graph_builder.add_edge("build_route", "present_full_plan")
+    graph_builder.add_edge("present_full_plan", END)
 
-    graph_builder.add_edge(
-        "present_full_plan", "handle_plan_feedback"
-    )  # Пользовательский ответ будет последним в messages
-
-    # 7. От обработки обратной связи
     graph_builder.add_conditional_edges(
         "handle_plan_feedback",
         check_plan_feedback_router_edge,
         {
             "confirm_changes_node": "confirm_changes",
             "search_events_node": "search_events",
-            "clarify_missing_data_node": "clarify_missing_data",  # Если фидбек требует уточнений
+            "clarify_missing_data_node": "clarify_missing_data",
             END: END,
         },
     )
 
-    # 8. От подтверждения изменений
-    # confirm_changes_node задал вопрос. Ждем ответа. Конец тика.
-    # Ответ пользователя на этот вопрос должен быть обработан handle_plan_feedback_node.
-    graph_builder.add_edge(
-        "confirm_changes", "handle_plan_feedback"
-    )  # Переименовал 'after_confirm_changes_edge'
-    # Теперь это просто переход, а handle_plan_feedback разберется
-
-    # 9. От узла ошибки
-    # error_handler задал вопрос. Ждем ответа. Конец тика.
-    # Ответ пользователя (новые критерии) пойдет на extract_initial_info.
-    # Это ребро не нужно, так как после error_handler цикл графа для текущего пользовательского сообщения завершается,
-    # и следующий ввод пользователя автоматически пойдет на точку входа "extract_initial_info".
-    # graph_builder.add_edge("error_handler", "extract_initial_info") # Это вызовет рекурсию без нового ввода
+    graph_builder.add_edge("confirm_changes", END)
 
     logger.info("All edges added. Graph definition complete.")
     return graph_builder
