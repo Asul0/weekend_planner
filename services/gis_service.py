@@ -2,7 +2,7 @@ import aiohttp
 import logging
 import asyncio
 from typing import Optional, List, Dict, Any
-
+import json
 from config.settings import settings  # Используем наш settings
 
 # GIS_API_KEY берется из settings
@@ -100,31 +100,41 @@ async def get_coords_from_address(
 
 
 async def get_route(
-    points: List[Dict[str, Any]],
+    points: List[Dict[str, Any]],  # Ожидаем список словарей с 'lon' и 'lat'
     transport: str = "driving",
-) -> Dict[str, Any]:  # Уточнил тип возвращаемого значения для консистентности
+) -> Dict[str, Any]:
     url = f"{ROUTING_API_BASE_URL}?key={settings.GIS_API_KEY}"
     headers = {"Content-Type": "application/json"}
 
-    formatted_points = []
+    # Формируем точки для API 2GIS. API ожидает 'x' для долготы и 'y' для широты.
+    # Но если ошибка "'lat' or 'lon' is missed" относится к этому payload, попробуем 'lon' и 'lat'.
+    # Проверьте документацию API 2GIS Routing на актуальный формат!
+    # Пока оставим как было, предполагая, что 'x' и 'y' это правильно, а ошибка где-то еще.
+    api_points = []
     for p_idx, p_val in enumerate(points):
         if not isinstance(p_val, dict) or "lon" not in p_val or "lat" not in p_val:
             msg = f"Неверный формат точки {p_idx+1}. Ожидался {{'lon': float, 'lat': float}}, получено: {p_val}"
             logger.error(
                 f"2GIS Routing: Invalid point format at index {p_idx}: {p_val}."
             )
-            return {"status": "error", "message": msg}
-        formatted_points.append(
+            return {
+                "status": "error",
+                "message": msg,
+                "error_details": "Invalid input point format",
+            }
+
+        # Стандартный формат для 2GIS Routing API (x=lon, y=lat)
+        api_points.append(
             {
-                "lon": p_val["lon"],
-                "lat": p_val["lat"],
+                "lon": p_val["lon"],  # Долгота
+                "lat": p_val["lat"],  # Широта
                 "type": ("pedo" if transport == "walking" else "auto"),
             }
         )
 
-    payload = {"transport": transport, "points": formatted_points}
+    payload = {"transport": transport, "points": api_points}
     logger.info(
-        f"2GIS Routing: Requesting route. Transport: {transport}, Points: {len(formatted_points)}"
+        f"2GIS Routing: Requesting route. Transport: {transport}, Points: {len(api_points)}"
     )
     logger.debug(f"2GIS Routing: Request URL: {url}, Payload: {str(payload)[:500]}")
 
@@ -133,28 +143,39 @@ async def get_route(
             async with session.post(
                 url, json=payload, timeout=aiohttp.ClientTimeout(total=20)
             ) as response:
-                response_text = await response.text()
+                response_text = await response.text()  # Читаем текст ответа один раз
                 logger.debug(
                     f"2GIS Routing: Response Status: {response.status}, Body (first 500 chars): {response_text[:500]}"
                 )
 
                 if response.status == 200:
                     try:
-                        data = await response.json()
-                    except aiohttp.ContentTypeError:
+                        # Пытаемся парсить JSON из уже прочитанного текста
+                        data = (
+                            await response.json(content_type=None)
+                            if response.content_type == "application/json"
+                            else json.loads(response_text)
+                        )
+                    except (aiohttp.ContentTypeError, json.JSONDecodeError) as json_err:
                         logger.error(
-                            f"2GIS Routing API returned non-JSON response (status 200): {response_text[:500]}"
+                            f"2GIS Routing API returned non-JSON or malformed JSON (status 200): {response_text[:500]}. Error: {json_err}"
                         )
                         return {
                             "status": "error",
-                            "message": "Неожиданный формат ответа API маршрутов (не JSON).",
+                            "message": "Неожиданный или некорректный формат ответа API маршрутов (не JSON).",
+                            "error_details": str(json_err),
                         }
 
-                    routes = data.get("routes")
-                    if routes and isinstance(routes, list) and len(routes) > 0:
-                        route_item = routes[0]
-                        total_duration_seconds = route_item.get("duration")
-                        total_distance_meters = route_item.get("distance")
+                    # Убедимся, что data['result'] это список (как в вашем логе)
+                    result_list = data.get("result")
+                    if (
+                        result_list
+                        and isinstance(result_list, list)
+                        and len(result_list) > 0
+                    ):
+                        route_item = result_list[0]  # Берем первый маршрут
+                        total_duration_seconds = route_item.get("total_duration")
+                        total_distance_meters = route_item.get("total_distance")
 
                         if (
                             total_duration_seconds is not None
@@ -164,7 +185,6 @@ async def get_route(
                             distance_km = round(total_distance_meters / 1000, 1)
                             duration_text = f"~{duration_minutes} мин"
                             distance_text = f"~{distance_km} км"
-
                             logger.info(
                                 f"2GIS Routing: Route found - Duration: {duration_text}, Distance: {distance_text}"
                             )
@@ -177,69 +197,105 @@ async def get_route(
                             }
                         else:
                             logger.warning(
-                                f"2GIS Routing: Could not extract duration/distance from route: {route_item}"
+                                f"2GIS Routing: Could not extract total_duration/total_distance from route: {route_item}"
                             )
                             return {
                                 "status": "error",
-                                "message": "Не удалось извлечь детали маршрута из ответа API 2GIS.",
+                                "message": "Не удалось извлечь детали маршрута (длительность/расстояние).",
+                                "error_details": "Missing duration/distance in API response.",
                             }
+                    # Обработка ошибок и предупреждений от API 2GIS, если они есть в ответе 200 OK
                     elif data.get("error"):
                         error_info = data.get("error")
                         error_message = error_info.get(
-                            "message", "Неизвестная ошибка API маршрутов 2GIS"
+                            "message",
+                            "Неизвестная ошибка API маршрутов 2GIS (в ответе 200 OK)",
                         )
-                        logger.error(f"2GIS Routing API returned error: {error_info}")
-                        return {"status": "api_error", "message": error_message}
+                        logger.error(
+                            f"2GIS Routing API returned error in 200 OK response: {error_info}"
+                        )
+                        return {
+                            "status": "api_error",
+                            "message": error_message,
+                            "error_details": error_info,
+                        }
                     elif data.get("warning"):
                         warning_info = data.get("warning")
                         warning_message = warning_info.get(
-                            "message", "API маршрутов 2GIS вернуло предупреждение"
+                            "message",
+                            "API маршрутов 2GIS вернуло предупреждение (в ответе 200 OK)",
                         )
                         logger.warning(
-                            f"2GIS Routing API returned warning: {warning_info}"
+                            f"2GIS Routing API returned warning in 200 OK response: {warning_info}"
                         )
-                        return {"status": "api_warning", "message": warning_message}
+                        # Можно решить, считать ли это успехом или ошибкой
+                        return {
+                            "status": "api_warning",
+                            "message": warning_message,
+                            "warning_details": warning_info,
+                        }
                     else:
                         logger.warning(
-                            f"2GIS Routing API: Unexpected response structure (status 200): {str(data)[:500]}"
+                            f"2GIS Routing API: Unexpected response structure in 200 OK (no 'result' list or 'error'): {str(data)[:500]}"
                         )
                         return {
                             "status": "error",
-                            "message": "Неожиданный формат ответа API 2GIS.",
+                            "message": "Неожиданный формат успешного ответа от API 2GIS.",
+                            "error_details": "Missing 'result' or 'error' in 200 OK response.",
                         }
-                else:
-                    error_message_text = response_text[:200]
+
+                elif response.status == 422:  # Явная обработка 422
+                    error_details_422 = ""
                     try:
-                        error_data = await response.json()
-                        api_err_msg = error_data.get("error", {}).get("message")
-                        if api_err_msg:
-                            error_message_text = api_err_msg
+                        error_data_422 = (
+                            await response.json(content_type=None)
+                            if response.content_type == "application/json"
+                            else json.loads(response_text)
+                        )
+                        error_details_422 = error_data_422.get(
+                            "message", response_text[:200]
+                        )
                     except:
-                        pass
+                        error_details_422 = response_text[:200]
+                    logger.error(
+                        f"2GIS Routing API HTTP error: Status {response.status}. Message: {error_details_422}"
+                    )
+                    return {
+                        "status": "http_error",
+                        "code": response.status,
+                        "message": f"Ошибка валидации данных для API маршрутов 2GIS: {error_details_422}",
+                        "error_details": error_details_422,
+                    }
+                else:  # Другие HTTP ошибки
+                    error_message_text = response_text[:200]
                     logger.error(
                         f"2GIS Routing API HTTP error: Status {response.status}. Message: {error_message_text}"
                     )
                     return {
                         "status": "http_error",
                         "code": response.status,
-                        "message": f"Ошибка API маршрутов 2GIS: {error_message_text}",
+                        "message": f"Ошибка API маршрутов 2GIS (код: {response.status}): {error_message_text}",
+                        "error_details": error_message_text,
                     }
+
     except aiohttp.ClientConnectorError as e:
         logger.error(f"2GIS Routing: Connection error - {e}")
         return {
             "status": "connection_error",
             "message": f"Ошибка соединения с сервисом маршрутов 2GIS: {e}",
+            "error_details": str(e),
         }
     except asyncio.TimeoutError:
         logger.error("2GIS Routing: Request timeout.")
         return {
             "status": "timeout",
             "message": "Запрос к API маршрутов 2GIS истек по таймауту.",
+            "error_details": "Timeout",
         }
     except Exception as e:
         logger.error(f"2GIS Routing: Unexpected error - {e}", exc_info=True)
         return {
             "status": "unknown_error",
             "message": f"Неизвестная ошибка при построении маршрута через 2GIS: {e}",
+            "error_details": str(e),
         }
-
