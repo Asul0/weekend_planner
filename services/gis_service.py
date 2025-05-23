@@ -242,23 +242,4 @@ async def get_route(
             "status": "unknown_error",
             "message": f"Неизвестная ошибка при построении маршрута через 2GIS: {e}",
         }
-async def get_route_duration(
-    from_lon: float,
-    from_lat: float,
-    to_lon: float,
-    to_lat: float,
-    transport_type: str = "driving",
-) -> Optional[int]:
-    """
-    Получает длительность маршрута между двумя точками в секундах.
-    Возвращает None, если маршрут не найден или произошла ошибка.
-    """
-    points = [{"lon": from_lon, "lat": from_lat}, {"lon": to_lon, "lat": to_lat}]
-    route_result = await get_route(points, transport=transport_type)
-    
-    if route_result and route_result.get("status") == "success":
-        duration = route_result.get("total_duration_seconds")
-        if duration is not None:
-            return int(duration) # Убедимся, что это целое число
-    logger.warning(f"get_route_duration: Failed to get duration for {from_lon},{from_lat} to {to_lon},{to_lat} via {transport_type}. Result: {route_result}")
-    return None
+async def get_route(
