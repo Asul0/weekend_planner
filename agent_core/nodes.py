@@ -662,120 +662,44 @@ from tools.route_builder_tool import route_builder_tool  # Наш инструм
 
 
 # --- Узел 5: Обработка ответа на адрес ИЛИ построение маршрута, если адрес не нужен / уже есть ---
-async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, Any]:
-    logger.info("Node: clarify_address_or_build_route_node executing...")
-    messages = state.get("messages", [])
-    collected_data: CollectedUserData = state.get("collected_data", {})  # type: ignore
+async def clarify_address_or_build_route_node(
+    state: AgentState,
+) -> Dict[str, Any]:  # Можете переименовать в build_route_node для ясности
+    logger.info(
+        "Node: build_route_node (formerly clarify_address_or_build_route_node) executing..."
+    )
+    collected_data: CollectedUserData = state.get("collected_data", {})
     current_events: Optional[List[Event]] = state.get("current_events")
-
-    user_start_address_original = collected_data.get("user_start_address_original")
     user_start_coords = collected_data.get("user_start_address_validated_coords")
 
-    # Если последний ответ был от пользователя и мы ждали адрес
-    if (
-        messages
-        and isinstance(messages[-1], HumanMessage)
-        and (
-            "user_start_address_original"
-            in collected_data.get("clarification_needed_fields", [])
-            or (not user_start_address_original and not user_start_coords)
-        )
-    ):  # Если адрес не был известен и не был уточнен ранее
-
-        potential_address = messages[-1].content
-        logger.info(
-            f"clarify_address_or_build_route_node: User provided potential address: '{potential_address}'"
-        )
-        # Пытаемся получить координаты для введенного адреса
-        # Город должен быть уже в collected_data["city_name"]
-        city_for_geocoding = collected_data.get("city_name")
-        if not city_for_geocoding:  # На всякий случай, если города нет
-            logger.error(
-                "clarify_address_or_build_route_node: City name missing in collected_data, cannot geocode address."
-            )
-            # Возвращаем запрос на уточнение города, если его нет
-            collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
-            return {
-                "collected_data": collected_data,
-                "status_message_to_user": "Пожалуйста, сначала уточните город.",
-                "awaiting_final_confirmation": False,
-                "current_route_details": None,  # Маршрут не построен
-            }
-
-        coords = await get_coords_from_address(
-            address=potential_address, city=city_for_geocoding
-        )
-        if coords:
-            collected_data["user_start_address_original"] = potential_address
-            collected_data["user_start_address_validated_coords"] = {
-                "lon": coords[0],
-                "lat": coords[1],
-            }
-            logger.info(
-                f"clarify_address_or_build_route_node: Address '{potential_address}' geocoded to {coords}"
-            )
-            # Убираем адрес из списка для уточнения, если он там был
-            if (
-                "clarification_needed_fields" in collected_data
-                and collected_data["clarification_needed_fields"]
-            ):
-                collected_data["clarification_needed_fields"] = [  # type: ignore
-                    f for f in collected_data["clarification_needed_fields"] if f != "user_start_address_original"  # type: ignore
-                ]
-                if not collected_data["clarification_needed_fields"]:  # type: ignore
-                    del collected_data["clarification_needed_fields"]  # type: ignore
-            user_start_coords = collected_data[
-                "user_start_address_validated_coords"
-            ]  # Обновляем для текущего вызова
-        else:
-            logger.warning(
-                f"clarify_address_or_build_route_node: Could not geocode address '{potential_address}' in city '{city_for_geocoding}'."
-            )
-            # Адрес не распознан, снова просим уточнить ИМЕННО АДРЕС
-            collected_data.setdefault("clarification_needed_fields", []).append("user_start_address_original")  # type: ignore
-            msg = "Не удалось распознать этот адрес. Пожалуйста, попробуйте ввести его еще раз (улица и номер дома) или укажите другой."
-            new_messages = messages + [AIMessage(content=msg)]
-            return {
-                "collected_data": collected_data,
-                "messages": new_messages,
-                "status_message_to_user": msg,
-                "awaiting_final_confirmation": False,
-                "current_route_details": None,
-            }
-
-    # Логика построения маршрута
     if not current_events:
-        logger.warning(
-            "clarify_address_or_build_route_node: No current events, cannot build route."
-        )
+        logger.warning("build_route_node: No current events, cannot build route.")
+        # Возвращаем ошибку, чтобы present_full_plan_node мог ее отобразить
         return {
-            "current_route_details": None,
-            "status_message_to_user": "Нет мероприятий для построения маршрута.",
+            "current_route_details": RouteDetails(
+                status="error", error_message="Нет мероприятий для построения маршрута."
+            ),
+            "is_full_plan_with_route_proposed": False,  # Технически план будет, но без маршрута и с ошибкой
         }
 
-    # Если только одно мероприятие и не указан адрес пользователя, то маршрут не строится (согласно инструкции п1)
     if len(current_events) == 1 and not user_start_coords:
         logger.info(
-            "clarify_address_or_build_route_node: One event and no user address, route not built."
+            "build_route_node: One event and no user address, route not built as per logic."
         )
+        # Возвращаем None или специальный статус, чтобы present_full_plan_node знал, что маршрут не строился
         return {
             "current_route_details": None,
             "is_full_plan_with_route_proposed": False,
-        }  # План без маршрута
+        }
 
-    # Формируем точки для маршрута
-    points_for_api: List[Dict[str, Any]] = []
     start_location_for_api: Optional[LocationModel] = None
-
     if user_start_coords:
         start_location_for_api = LocationModel(
-            lon=user_start_coords["lon"],
-            lat=user_start_coords["lat"],
+            lon=user_start_coords["lon"],  # type: ignore
+            lat=user_start_coords["lat"],  # type: ignore
             address_string=collected_data.get("user_start_address_original"),
         )
-    elif (
-        len(current_events) > 1
-    ):  # Если адреса пользователя нет, но мероприятий больше одного, строим от первого
+    elif len(current_events) > 1:
         first_event = current_events[0]
         if (
             first_event.place_coords_lon is not None
@@ -788,13 +712,8 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
             )
         elif (
             first_event.place_address
-        ):  # Если у первого мероприятия нет координат, но есть адрес
-            logger.debug(
-                f"clarify_address_or_build_route_node: Geocoding first event address: '{first_event.place_address}'"
-            )
-            city_for_geocoding = collected_data.get(
-                "city_name", ""
-            )  # Город должен быть
+        ):  # Попытка геокодировать адрес первого события, если нет координат
+            city_for_geocoding = collected_data.get("city_name", "")
             coords = await get_coords_from_address(
                 address=first_event.place_address, city=city_for_geocoding
             )
@@ -806,24 +725,29 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
                 )
             else:
                 logger.error(
-                    f"clarify_address_or_build_route_node: Could not geocode first event address for routing: {first_event.place_address}"
+                    f"build_route_node: Could not geocode first event address '{first_event.place_address}' for routing."
                 )
-                # Ошибка, не можем построить маршрут
                 return {
-                    "current_route_details": None,
-                    "status_message_to_user": f"Не удалось определить координаты первого мероприятия '{first_event.name}' для построения маршрута.",
+                    "current_route_details": RouteDetails(
+                        status="error",
+                        error_message=f"Не удалось определить координаты первого мероприятия '{first_event.name}'.",
+                    ),
+                    "is_full_plan_with_route_proposed": False,
                 }
-        else:  # Нет ни координат ни адреса у первого мероприятия
+        else:
             logger.error(
-                f"clarify_address_or_build_route_node: First event '{first_event.name}' has no coordinates or address for routing."
+                f"build_route_node: First event '{first_event.name}' has no coordinates or address for routing."
             )
             return {
-                "current_route_details": None,
-                "status_message_to_user": f"У мероприятия '{first_event.name}' не указан адрес или координаты, маршрут не построить.",
+                "current_route_details": RouteDetails(
+                    status="error",
+                    error_message=f"У мероприятия '{first_event.name}' не указан адрес для маршрута.",
+                ),
+                "is_full_plan_with_route_proposed": False,
             }
-    else:  # Меньше 2х мероприятий и нет адреса пользователя - маршрут не нужен
+    else:  # Менее 2х событий и нет адреса пользователя
         logger.info(
-            "clarify_address_or_build_route_node: Not enough points for routing and no user_start_address."
+            "build_route_node: Not enough points for routing and no user_start_address."
         )
         return {
             "current_route_details": None,
@@ -831,8 +755,6 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
         }
 
     event_points_for_api: List[LocationModel] = []
-    # Если старт от пользователя, то все current_events идут в event_points
-    # Если старт от первого мероприятия, то оно уже в start_location_for_api, а остальные в event_points
     events_to_route = current_events if user_start_coords else current_events[1:]
 
     for event_obj in events_to_route:
@@ -847,12 +769,7 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
                     address_string=event_obj.place_address,
                 )
             )
-        elif (
-            event_obj.place_address
-        ):  # Если нет координат, но есть адрес, пытаемся геокодировать
-            logger.debug(
-                f"clarify_address_or_build_route_node: Geocoding event address for routing: '{event_obj.place_address}'"
-            )
+        elif event_obj.place_address:
             city_for_geocoding = collected_data.get("city_name", "")
             coords = await get_coords_from_address(
                 address=event_obj.place_address, city=city_for_geocoding
@@ -867,35 +784,44 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
                 )
             else:
                 logger.warning(
-                    f"clarify_address_or_build_route_node: Could not geocode address for event '{event_obj.name}' ({event_obj.place_address}). Skipping for route."
+                    f"build_route_node: Could not geocode address for event '{event_obj.name}' ({event_obj.place_address}). Skipping for route."
                 )
-                # Можно решить, прерывать ли построение маршрута или строить без этой точки
-                # Пока пропускаем точку, если не удалось геокодировать
-        else:  # Нет ни координат, ни адреса
+        else:
             logger.warning(
-                f"clarify_address_or_build_route_node: Event '{event_obj.name}' has no coordinates or address. Skipping for route."
+                f"build_route_node: Event '{event_obj.name}' has no coordinates or address. Skipping for route."
             )
 
-    if not start_location_for_api or (
-        len(current_events) > 0
-        and not event_points_for_api
-        and len(current_events) > (1 if not user_start_coords else 0)
-    ):
-        # Если начальная точка не определена, или есть мероприятия, но ни для одного не удалось получить координаты/адрес
-        logger.error(
-            "clarify_address_or_build_route_node: Not enough valid points with coordinates to build a route."
-        )
+    if not start_location_for_api:
+        logger.error("build_route_node: Start location for API is not defined.")
         return {
-            "current_route_details": None,
-            "status_message_to_user": "Не удалось определить координаты для мероприятий, чтобы построить маршрут.",
+            "current_route_details": RouteDetails(
+                status="error", error_message="Не определена начальная точка маршрута."
+            ),
+            "is_full_plan_with_route_proposed": False,
         }
 
-    # Если только start_location_for_api и нет event_points_for_api (например, одно мероприятие и это оно), то маршрут не нужен.
-    if start_location_for_api and not event_points_for_api and len(current_events) <= 1:
-        logger.info(
-            "clarify_address_or_build_route_node: Only a single destination point, route not strictly needed from tool."
+    if (
+        not event_points_for_api and len(events_to_route) > 0
+    ):  # Если были события для маршрута, но ни для одного не удалось получить точки
+        logger.error(
+            "build_route_node: No valid event points with coordinates to build a route to."
         )
-        # Возвращаем "успех", но с нулевой длительностью, агент это обработает
+        return {
+            "current_route_details": RouteDetails(
+                status="error",
+                error_message="Не удалось определить координаты для мероприятий назначения.",
+            ),
+            "is_full_plan_with_route_proposed": False,
+        }
+
+    if (
+        not event_points_for_api
+    ):  # Если нет точек назначения (например, только одно событие от адреса пользователя)
+        logger.info(
+            "build_route_node: No event points to route to (e.g., single event from user address or route between events with only one valid)."
+        )
+        # Это может быть нормальным для одного события от адреса пользователя.
+        # Возвращаем "успех", но с нулевой длительностью, present_full_plan_node это обработает.
         return {
             "current_route_details": RouteDetails(
                 status="success",
@@ -904,17 +830,14 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
                 distance_meters=0,
                 distance_text="0 км",
             ),
-            "is_full_plan_with_route_proposed": False,  # Маршрут не "строился"
+            "is_full_plan_with_route_proposed": True,  # Маршрут (пустой) "построен"
         }
 
     tool_args = RouteBuilderToolArgs(
-        start_point=start_location_for_api,
-        event_points=event_points_for_api,
-        # transport_type по умолчанию 'driving'
+        start_point=start_location_for_api, event_points=event_points_for_api
     )
-
     logger.info(
-        f"clarify_address_or_build_route_node: Calling route_builder_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
+        f"build_route_node: Calling route_builder_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
     )
     route_data_dict = await route_builder_tool.ainvoke(
         tool_args.model_dump(exclude_none=True)
@@ -924,30 +847,28 @@ async def clarify_address_or_build_route_node(state: AgentState) -> Dict[str, An
         route_details_obj = RouteDetails(**route_data_dict)
         if route_details_obj.status == "success":
             logger.info(
-                f"clarify_address_or_build_route_node: Route successfully built. Duration: {route_details_obj.duration_text}"
+                f"build_route_node: Route successfully built. Duration: {route_details_obj.duration_text}"
             )
-            return {
-                "current_route_details": route_details_obj,
-                "is_full_plan_with_route_proposed": True,
-            }
         else:
             logger.error(
-                f"clarify_address_or_build_route_node: Route building failed by tool. Status: {route_details_obj.status}, Msg: {route_details_obj.error_message}"
+                f"build_route_node: Route building failed by tool. Status: {route_details_obj.status}, Msg: {route_details_obj.error_message}"
             )
-            return {
-                "current_route_details": route_details_obj,
-                "status_message_to_user": f"Не удалось построить маршрут: {route_details_obj.error_message}",
-                "is_full_plan_with_route_proposed": False,
-            }
+        # is_full_plan_with_route_proposed будет True, если status="success"
+        return {
+            "current_route_details": route_details_obj,
+            "is_full_plan_with_route_proposed": route_details_obj.status == "success",
+        }
     except ValidationError as ve:
         logger.error(
-            f"clarify_address_or_build_route_node: Validation error for route_data: {route_data_dict}. Error: {ve}"
+            f"build_route_node: Validation error for route_data: {route_data_dict}. Error: {ve}"
         )
         return {
-            "current_route_details": None,
-            "status_message_to_user": "Ошибка при обработке данных маршрута.",
+            "current_route_details": RouteDetails(
+                status="error", error_message="Ошибка при обработке данных маршрута."
+            ),
             "is_full_plan_with_route_proposed": False,
         }
+
 
 
 # --- Узел 6: Представление полного плана (мероприятия + маршрут) ---
