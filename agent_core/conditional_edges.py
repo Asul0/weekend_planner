@@ -14,22 +14,38 @@ logger = logging.getLogger(__name__)
 
 def check_initial_data_sufficiency_edge(state: AgentState) -> str:
     logger.debug("Edge: check_initial_data_sufficiency_edge evaluating...")
-    collected_data: CollectedUserData = state.get("collected_data", {})  # type: ignore
-    clarification_fields: Optional[List[str]] = collected_data.get(
-        "clarification_needed_fields"
-    )
+    collected_data: CollectedUserData = state.get("collected_data", {})
     messages = state.get("messages", [])
 
     if messages and isinstance(messages[-1], AIMessage):
         logger.info(
-            "Edge: Last message was AIMessage. Agent is likely waiting for user response. Ending current graph tick."
+            "Edge: Last message was AIMessage. Agent is waiting for user response. Ending current graph tick."
         )
-        return END  # <--- ЯВНО УКАЗЫВАЕМ ЗАВЕРШИТЬ ТЕКУЩИЙ ПРОХОД ГРАФА
+        return END
 
-    # Эта логика сработает, только если последнее сообщение было HumanMessage (или если это самый первый вызов)
+    # Если мы успешно обработали адрес и он валиден
+    if (
+        not collected_data.get("awaiting_address_input")
+        and collected_data.get("user_start_address_validated_coords")
+        and collected_data.get("city_id_afisha")
+        and collected_data.get("parsed_dates_iso")
+        and (
+            collected_data.get("interests_keys_afisha")
+            or collected_data.get("interests_original")
+        )
+        and state.get("current_events")
+    ):  # Убеждаемся, что события уже были найдены (т.е., мы после present_initial_plan)
+        logger.info(
+            "Edge: Address known/processed and initial events present. Routing to 'build_route_node'."
+        )
+        return "build_route_node"  # Имя узла из вашего graph.py для построения маршрута
+
+    clarification_fields: Optional[List[str]] = collected_data.get(
+        "clarification_needed_fields"
+    )
     if clarification_fields and len(clarification_fields) > 0:
         logger.info(
-            "Edge: Data insufficient or time needs clarification (based on HumanMessage). Routing to 'clarify_missing_data_node'."
+            "Edge: Data insufficient or clarification needed. Routing to 'clarify_missing_data_node'."
         )
         return "clarify_missing_data_node"
 
@@ -40,12 +56,14 @@ def check_initial_data_sufficiency_edge(state: AgentState) -> str:
             collected_data.get("interests_keys_afisha")
             or collected_data.get("interests_original")
         )
-    ):  # хотя бы какие-то интересы
-        logger.info("Edge: Initial data sufficient. Routing to 'search_events_node'.")
+    ):
+        logger.info(
+            "Edge: Initial data sufficient for event search. Routing to 'search_events_node'."
+        )
         return "search_events_node"
     else:
         logger.warning(
-            "Edge: Critical data still missing after HumanMessage processing. Routing to 'clarify_missing_data_node'."
+            "Edge: Critical data for event search still missing. Routing to 'clarify_missing_data_node'."
         )
         return "clarify_missing_data_node"
 
@@ -115,25 +133,21 @@ def check_address_needs_clarification_or_route_exists_edge(state: AgentState) ->
 
 def check_plan_feedback_router_edge(state: AgentState) -> str:
     logger.debug("Edge: check_plan_feedback_router_edge evaluating...")
+
     if state.get("awaiting_final_confirmation"):
-        # Это не должно происходить, если handle_plan_feedback_node сбросил флаг.
-        # Но если пользователь ответил неясно, и мы снова ждем подтверждения.
         logger.info(
-            "Edge: Still awaiting final confirmation after feedback. Routing back to 'handle_plan_feedback_node'."
+            "Edge: Awaiting final confirmation. Agent asked a question. Ending current graph tick to wait for user."
         )
-        return "handle_plan_feedback_node"  # Или, может, снова present_full_plan_node, чтобы повторить вопрос
+        return END
 
     pending_modification = state.get("pending_plan_modification_request")
-
-    # Если есть pending_modification, значит, пользователь запросил изменения,
-    # и мы должны спросить подтверждение этих изменений (логика примера 2 из инструкции).
     if pending_modification:
         logger.info(
             "Edge: Pending plan modification. Routing to 'confirm_changes_node'."
         )
         return "confirm_changes_node"
 
-    collected_data: CollectedUserData = state.get("collected_data", {})  # type: ignore
+    collected_data: CollectedUserData = state.get("collected_data", {})
     if collected_data.get("clarification_needed_fields"):
         logger.info(
             "Edge: Clarification needed after feedback. Routing to 'clarify_missing_data_node'."
@@ -142,18 +156,18 @@ def check_plan_feedback_router_edge(state: AgentState) -> str:
 
     last_ai_message_content = ""
     if state.get("messages"):
-        for msg in reversed(state.get("messages", [])):  # type: ignore
-            if msg.type == "ai":  # type: ignore
-                last_ai_message_content = msg.content  # type: ignore
+        for msg in reversed(state.get("messages", [])):
+            if msg.type == "ai":
+                last_ai_message_content = msg.content
                 break
     if "Отлично! Рад был помочь" in last_ai_message_content:
         logger.info("Edge: Plan confirmed and finalized. Routing to END.")
-        return "__end__"  # Используем специальное имя для конечного узла LangGraph
+        return END
 
     logger.info(
         "Edge: Changes applied or new criteria set from feedback. Routing to 'search_events_node' to rebuild plan."
     )
-    return "search_events_node"  # Пересчитываем мероприятия с новыми данными
+    return "search_events_node"
 
 
 def after_confirm_changes_edge(state: AgentState) -> str:
