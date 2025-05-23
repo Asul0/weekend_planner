@@ -9,7 +9,43 @@ from pydantic import (
 from typing import Optional, Any
 import logging
 
+
 # --- Схемы для извлечения информации из запроса пользователя ---
+class RouteSegment(BaseModel):
+    """Детали одного сегмента маршрута между двумя точками."""
+
+    from_address: Optional[str] = Field(
+        default=None, description="Адрес начальной точки сегмента (если известен)"
+    )
+    to_address: Optional[str] = Field(
+        default=None, description="Адрес конечной точки сегмента (если известен)"
+    )
+    duration_seconds: Optional[int] = Field(
+        default=None, description="Длительность сегмента в секундах."
+    )
+    duration_text: Optional[str] = Field(
+        default=None,
+        description="Текстовое представление длительности сегмента (например, '~15 мин').",
+    )
+    distance_meters: Optional[int] = Field(
+        default=None, description="Расстояние сегмента в метрах."
+    )
+    distance_text: Optional[str] = Field(
+        default=None,
+        description="Текстовое представление расстояния сегмента (например, '~2 км').",
+    )
+    transport_type: Optional[str] = Field(
+        default=None, description="Тип транспорта для этого сегмента."
+    )
+    # Примечание: можно добавить поле 'error_message' для сегмента, если его построение не удалось
+    segment_status: str = Field(
+        default="unknown",
+        description="Статус построения этого сегмента ('success', 'error')",
+    )
+    segment_error_message: Optional[str] = Field(
+        default=None,
+        description="Сообщение об ошибке для этого сегмента, если segment_status='error'",
+    )
 
 
 class ExtractedInitialInfo(BaseModel):
@@ -213,28 +249,35 @@ class Event(BaseModel):
 
 
 class RouteDetails(BaseModel):
-    """Детали построенного маршрута, включая статус, общую длительность и расстояние."""
+    """
+    Полные детали построенного маршрута, включая все сегменты.
+    """
 
     status: str = Field(
-        description="Статус операции построения маршрута (например, 'success', 'error', 'api_error')."
+        description="Общий статус построения всего маршрута ('success', 'partial_success', 'error', 'api_error', etc.). 'partial_success' если не все сегменты построены."
     )
-    duration_seconds: Optional[int] = Field(
-        default=None, description="Общая расчетная длительность маршрута в секундах."
+    segments: Optional[List[RouteSegment]] = Field(
+        default=None, description="Список сегментов маршрута."
     )
-    duration_text: Optional[str] = Field(
+    total_duration_seconds: Optional[int] = Field(
         default=None,
-        description="Текстовое представление общей длительности маршрута (например, '~25 мин').",
+        description="Суммарная длительность всех успешно построенных сегментов в секундах.",
     )
-    distance_meters: Optional[int] = Field(
-        default=None, description="Общее расчетное расстояние маршрута в метрах."
-    )
-    distance_text: Optional[str] = Field(
+    total_duration_text: Optional[str] = Field(
         default=None,
-        description="Текстовое представление общего расстояния маршрута (например, '~5 км').",
+        description="Текстовое представление суммарной длительности (например, '~45 мин').",
+    )
+    total_distance_meters: Optional[int] = Field(
+        default=None,
+        description="Суммарное расстояние всех успешно построенных сегментов в метрах.",
+    )
+    total_distance_text: Optional[str] = Field(
+        default=None,
+        description="Текстовое представление суммарного расстояния (например, '~10 км').",
     )
     error_message: Optional[str] = Field(
         default=None,
-        description="Сообщение об ошибке, если статус построения маршрута не 'success'.",
+        description="Общее сообщение об ошибке, если status не 'success' или 'partial_success'.",
     )
 
 
