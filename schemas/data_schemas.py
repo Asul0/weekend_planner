@@ -101,12 +101,16 @@ class ExtractedInitialInfo(BaseModel):
 class DateTimeParserToolArgs(BaseModel):
     """Аргументы для инструмента парсинга описания даты и времени на естественном языке."""
 
-    natural_language_date_time: str = Field(
-        description="Описание даты и/или времени на естественном языке (например, 'завтра в 7 вечера', 'через неделю', '15 июля', 'сегодня вечером')."
+    natural_language_date: str = Field(
+        description="Описание даты или периода на естественном языке (например, 'завтра', 'на выходных', '15 июля', 'сегодня'). Может включать и время, если оно там есть."
+    )
+    natural_language_time_qualifier: Optional[str] = Field(
+        default=None,
+        description="Дополнительное описание времени, если оно было извлечено отдельно (например, 'после 18:00', 'утром', 'с 14 до 17'). Может быть None.",
     )
     base_date_iso: Optional[str] = Field(
         default=None,
-        description="ISO строка базовой даты (YYYY-MM-DDTHH:MM:SS) для разрешения относительных дат (например, 'завтра'). Если не указана, используется текущая дата и время.",
+        description="ISO строка базовой даты (YYYY-MM-DDTHH:MM:SS) для разрешения относительных дат. Если не указана, используется текущая дата и время.",
     )
 
 
@@ -117,10 +121,10 @@ class EventSearchToolArgs(BaseModel):
         description="Числовой ID города (согласно API Афиши) для поиска мероприятий."
     )
     date_from: datetime = Field(
-        description="Дата и время начала периода поиска мероприятий (объект datetime)."
+        description="Дата и время начала периода поиска мероприятий (объект datetime). Фактически используется как дата начала дня."
     )
     date_to: datetime = Field(
-        description="Дата и время окончания периода поиска мероприятий (объект datetime)."
+        description="Дата и время окончания периода поиска мероприятий (объект datetime). Фактически используется как дата начала следующего дня."
     )
     interests_keys: Optional[List[str]] = Field(
         default=None,
@@ -128,16 +132,20 @@ class EventSearchToolArgs(BaseModel):
     )
     min_start_time_naive: Optional[datetime] = Field(
         default=None,
-        description="Минимальное время начала мероприятия (наивное, без таймзоны, объект datetime) для дополнительной фильтрации.",
+        description="Минимальное ВРЕМЯ НАЧАЛА мероприятия (наивное, без таймзоны, объект datetime) для дополнительной фильтрации. Мероприятие должно НАЧАТЬСЯ не ранее этого времени.",
     )
+    max_start_time_naive: Optional[datetime] = Field(
+        default=None,
+        description="Максимальное ВРЕМЯ НАЧАЛА мероприятия (наивное, без таймзоны, объект datetime) для фильтрации. Мероприятие должно НАЧАТЬСЯ не позже этого времени.",
+    )  # НОВОЕ
     max_budget_per_person: Optional[int] = Field(
         default=None,
         description="Максимальный бюджет на одного человека в рублях для фильтрации мероприятий по цене.",
     )
     time_constraints_for_next_event: Optional[Dict[str, datetime]] = Field(
         default=None,
-        description="Словарь с временными ограничениями для следующего мероприятия, если в плане уже есть другие. Ключи: 'start_after_naive' (datetime), 'end_before_naive' (datetime).",
-    )
+        description="Словарь с временными ограничениями для следующего мероприятия...",
+    )  # остается
     exclude_session_ids: Optional[List[int]] = Field(
         default=None,
         description="Список числовых ID сессий мероприятий, которые нужно исключить из результатов поиска.",
@@ -292,11 +300,21 @@ class ParsedDateTime(BaseModel):
         default=None, description="Извлеченный день месяца (число)."
     )
     hour: Optional[int] = Field(
-        default=None, description="Извлеченный час (число от 0 до 23)."
+        default=None, description="Извлеченный час НАЧАЛА (число от 0 до 23)."
     )
     minute: Optional[int] = Field(
-        default=None, description="Извлеченная минута (число от 0 до 59)."
+        default=None, description="Извлеченная минута НАЧАЛА (число от 0 до 59)."
     )
+
+    end_hour: Optional[int] = Field(
+        default=None,
+        description="Извлеченный час КОНЦА временного диапазона (число от 0 до 23), если указан.",
+    )  # НОВОЕ
+    end_minute: Optional[int] = Field(
+        default=None,
+        description="Извлеченная минута КОНЦА временного диапазона (число от 0 до 59), если указана.",
+    )  # НОВОЕ
+
     is_ambiguous: bool = Field(
         default=False,
         description="Флаг (True/False), указывающий, является ли распознанная дата/время неполной или неоднозначной и требует ли дополнительного уточнения от пользователя.",
