@@ -3,6 +3,10 @@ from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, date, timedelta
 from datetime import datetime, timedelta
 import aiohttp
+from services.gis_service import (
+    get_coords_from_address,
+    get_route,
+)  # Добавлен get_route
 
 # Pydantic и Langchain для сообщений и схем
 from pydantic import (
@@ -70,8 +74,6 @@ logger = logging.getLogger(__name__)
 async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: extract_initial_info_node executing...")
     messages = state.get("messages", [])
-
-    # Всегда работаем с копией, чтобы изменения были локальны до возврата
     current_collected_data: CollectedUserData = dict(state.get("collected_data", {}))  # type: ignore
 
     if not messages or not isinstance(messages[-1], HumanMessage):
@@ -79,7 +81,7 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
             "extract_initial_info_node: No new HumanMessage. Returning current state."
         )
         return {
-            "collected_data": current_collected_data,  # Возвращаем ту же копию, если ничего не делали
+            "collected_data": current_collected_data,
             "messages": messages,
             "clarification_context": state.get("clarification_context"),
         }
@@ -97,16 +99,15 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     )
 
     current_clarification_context = None
-    current_collected_data["clarification_needed_fields"] = []  # type: ignore # Всегда сбрасываем в начале обработки нового сообщения
+    current_collected_data["clarification_needed_fields"] = []  # type: ignore
 
     if is_reply_to_address_request:
+        # ... (блок обработки адреса остается без изменений, как в твоей последней версии nodes.txt)
         logger.info(f"Input '{user_query}' is being treated as an address.")
-        # Город ДОЛЖЕН уже быть в current_collected_data
         city_for_geocoding = current_collected_data.get("city_name")
-
         if not city_for_geocoding:
             logger.error(
-                "extract_initial_info_node: City name missing in collected_data while expecting address input."
+                "extract_initial_info_node: City name missing while expecting address."
             )
             current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
             if "awaiting_address_input" in current_collected_data:
@@ -128,13 +129,11 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                     del current_collected_data["awaiting_address_input"]  # type: ignore
             else:
                 logger.warning(
-                    f"Could not geocode address '{user_query}' in city '{city_for_geocoding}'. Requesting clarification for address."
+                    f"Could not geocode address '{user_query}' in city '{city_for_geocoding}'."
                 )
-                if "user_start_address_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
-                    current_collected_data.setdefault("clarification_needed_fields", []).append("user_start_address_original")  # type: ignore
-                # Флаг awaiting_address_input остается True
+                current_collected_data.setdefault("clarification_needed_fields", []).append("user_start_address_original")  # type: ignore
                 current_clarification_context = "Не удалось распознать этот адрес. Пожалуйста, попробуйте ввести его еще раз (улица и номер дома) или укажите другой."
-
+                current_collected_data["awaiting_address_input"] = True  # type: ignore
         logger.debug(
             f"extract_initial_info_node: collected_data after address processing: {current_collected_data}"
         )
@@ -149,9 +148,12 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     prev_city_id_afisha = current_collected_data.get("city_id_afisha")
     prev_dates_desc = current_collected_data.get("dates_description_original")
     prev_parsed_dates = current_collected_data.get("parsed_dates_iso")
+    prev_parsed_end_dates = current_collected_data.get(
+        "parsed_end_dates_iso"
+    )  # Сохраняем предыдущее конечное время
     prev_interests_orig = current_collected_data.get("interests_original")
     prev_interests_keys = current_collected_data.get("interests_keys_afisha")
-    # Бюджет и user_start_address могут быть перезаписаны, если LLM их извлечет
+    prev_raw_time_desc = current_collected_data.get("raw_time_description_original")
 
     llm = get_gigachat_client()
     structured_llm = llm.with_structured_output(ExtractedInitialInfo)
@@ -167,7 +169,7 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
             f"extract_initial_info_node: LLM Extracted Info: {extracted_info.model_dump_json(indent=2)}"
         )
 
-        # Город: обновляем только если LLM извлек новый город
+        # Город (логика без изменений)
         if extracted_info.city:
             current_collected_data["city_name"] = extracted_info.city
             cities_from_afisha = await fetch_cities_internal()
@@ -176,43 +178,24 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                 current_collected_data["city_id_afisha"] = found_city_afisha["id"]  # type: ignore
             else:
                 current_collected_data["city_id_afisha"] = None  # type: ignore
-                current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
-        elif prev_city_name:  # Если LLM не вернул город, а он был, используем старый
+                if "city_name" not in current_collected_data.get(
+                    "clarification_needed_fields", []
+                ):
+                    current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
+        elif prev_city_name:
             current_collected_data["city_name"] = prev_city_name
             current_collected_data["city_id_afisha"] = prev_city_id_afisha  # type: ignore
-        elif not current_collected_data.get("city_name"):  # Если города нет и не было
-            current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
+        elif not current_collected_data.get("city_name"):
+            if "city_name" not in current_collected_data.get(
+                "clarification_needed_fields", []
+            ):
+                current_collected_data.setdefault("clarification_needed_fields", []).append("city_name")  # type: ignore
 
-        # Даты: обновляем, если LLM извлек новое описание дат
-        if extracted_info.dates_description:
-            current_collected_data["dates_description_original"] = extracted_info.dates_description  # type: ignore
-            current_date_iso = datetime.now().isoformat()
-            parsed_date_time_result = await datetime_parser_tool.ainvoke(
-                {
-                    "natural_language_date_time": extracted_info.dates_description,
-                    "base_date_iso": current_date_iso,
-                }
-            )
-            if parsed_date_time_result.get("datetime_iso"):
-                current_collected_data["parsed_dates_iso"] = [parsed_date_time_result["datetime_iso"]]  # type: ignore
-                if parsed_date_time_result.get("is_ambiguous"):
-                    current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
-                    current_clarification_context = parsed_date_time_result.get(
-                        "clarification_needed"
-                    )
-            elif not current_collected_data.get("parsed_dates_iso") and not prev_parsed_dates:  # type: ignore
-                current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
-        elif prev_dates_desc:  # Если LLM не вернул даты, а они были, используем старые
-            current_collected_data["dates_description_original"] = prev_dates_desc  # type: ignore
-            current_collected_data["parsed_dates_iso"] = prev_parsed_dates  # type: ignore
-        elif not current_collected_data.get("parsed_dates_iso"):  # Дат нет и не было
-            current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
-
-        # Интересы: обновляем, если LLM извлек новые интересы
+        # Интересы (логика без изменений)
         if extracted_info.interests:
             current_collected_data["interests_original"] = extracted_info.interests  # type: ignore
             mapped_interest_keys = []
-            for interest_str in extracted_info.interests:
+            for interest_str in extracted_info.interests:  # type: ignore
                 key = None
                 s = interest_str.lower()
                 if "фильм" in s or "кино" in s:
@@ -227,32 +210,86 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                     key = interest_str.capitalize()
                 mapped_interest_keys.append(key)
             current_collected_data["interests_keys_afisha"] = list(set(mapped_interest_keys))  # type: ignore
-        elif (
-            prev_interests_orig
-        ):  # Если LLM не вернул интересы, а они были, используем старые
+        elif prev_interests_orig:
             current_collected_data["interests_original"] = prev_interests_orig  # type: ignore
             current_collected_data["interests_keys_afisha"] = prev_interests_keys  # type: ignore
-        elif not current_collected_data.get(
-            "interests_keys_afisha"
-        ):  # Интересов нет и не было
-            current_collected_data.setdefault("clarification_needed_fields", []).append("interests_original")  # type: ignore
+        elif not current_collected_data.get("interests_keys_afisha"):
+            if "interests_original" not in current_collected_data.get(
+                "clarification_needed_fields", []
+            ):
+                current_collected_data.setdefault("clarification_needed_fields", []).append("interests_original")  # type: ignore
 
-        if extracted_info.budget is not None:  # Бюджет может быть просто обновлен
+        # Бюджет (логика без изменений)
+        if extracted_info.budget is not None:
             current_collected_data["budget_original"] = extracted_info.budget  # type: ignore
             current_collected_data["budget_current_search"] = extracted_info.budget  # type: ignore
 
-        if (
-            extracted_info.raw_time_description
-        ):  # raw_time_description также может быть просто обновлен
-            if not current_collected_data.get(
-                "dates_description_original"
-            ):  # Но только если dates_description не был извлечен более явно
-                current_collected_data["dates_description_original"] = extracted_info.raw_time_description  # type: ignore
-            current_collected_data["raw_time_description_original"] = extracted_info.raw_time_description  # type: ignore
+        # Даты и Время
+        dates_desc_from_llm = extracted_info.dates_description
+        time_qualifier_from_llm = extracted_info.raw_time_description
+
+        if dates_desc_from_llm or time_qualifier_from_llm:
+            if dates_desc_from_llm:
+                current_collected_data["dates_description_original"] = dates_desc_from_llm  # type: ignore
+            if time_qualifier_from_llm:
+                current_collected_data["raw_time_description_original"] = time_qualifier_from_llm  # type: ignore
+
+            natural_date_for_parser = (
+                dates_desc_from_llm if dates_desc_from_llm else "сегодня"
+            )
             if (
-                not current_clarification_context
-            ):  # Устанавливаем контекст, только если не было более специфичного от парсера дат
-                current_clarification_context = f"Пользователь указал время как '{extracted_info.raw_time_description}'. Уточните, пожалуйста, время."
+                not dates_desc_from_llm and time_qualifier_from_llm and prev_dates_desc
+            ):  # Если есть только уточнение времени и была предыдущая дата
+                natural_date_for_parser = prev_dates_desc  # type: ignore
+            elif (
+                not dates_desc_from_llm and time_qualifier_from_llm
+            ):  # Если есть только уточнение времени и НЕ было предыдущей даты
+                current_collected_data["dates_description_original"] = "сегодня"  # type: ignore
+
+            current_iso_for_parser = datetime.now().isoformat()
+            parsed_date_time_result = await datetime_parser_tool.ainvoke(
+                {
+                    "natural_language_date": natural_date_for_parser,  # type: ignore
+                    "natural_language_time_qualifier": time_qualifier_from_llm,
+                    "base_date_iso": current_iso_for_parser,
+                }
+            )
+
+            if parsed_date_time_result.get("datetime_iso"):
+                current_collected_data["parsed_dates_iso"] = [parsed_date_time_result["datetime_iso"]]  # type: ignore
+
+                if parsed_date_time_result.get(
+                    "end_datetime_iso"
+                ):  # Сохраняем конечное время
+                    current_collected_data["parsed_end_dates_iso"] = [parsed_date_time_result["end_datetime_iso"]]  # type: ignore
+                elif (
+                    "parsed_end_dates_iso" in current_collected_data
+                ):  # Очищаем, если его нет в новом результате
+                    del current_collected_data["parsed_end_dates_iso"]  # type: ignore
+
+                if parsed_date_time_result.get("is_ambiguous"):
+                    if "dates_description_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
+                        current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
+                    current_clarification_context = parsed_date_time_result.get(
+                        "clarification_needed"
+                    )
+            else:
+                if "dates_description_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
+                    current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
+                current_clarification_context = (
+                    parsed_date_time_result.get("clarification_needed")
+                    or parsed_date_time_result.get("error_message")
+                    or "Не удалось распознать дату или время из вашего запроса."
+                )
+
+        elif prev_parsed_dates:
+            current_collected_data["dates_description_original"] = prev_dates_desc  # type: ignore
+            current_collected_data["parsed_dates_iso"] = prev_parsed_dates  # type: ignore
+            if prev_parsed_end_dates:
+                current_collected_data["parsed_end_dates_iso"] = prev_parsed_end_dates  # type: ignore
+            if prev_raw_time_desc:
+                current_collected_data["raw_time_description_original"] = prev_raw_time_desc  # type: ignore
+        elif not current_collected_data.get("parsed_dates_iso"):
             if "dates_description_original" not in current_collected_data.get("clarification_needed_fields", []):  # type: ignore
                 current_collected_data.setdefault("clarification_needed_fields", []).append("dates_description_original")  # type: ignore
 
@@ -268,7 +305,11 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
 
     if "clarification_needed_fields" in current_collected_data and current_collected_data.get("clarification_needed_fields"):  # type: ignore
         fields_list = current_collected_data["clarification_needed_fields"]  # type: ignore
-        current_collected_data["clarification_needed_fields"] = list(dict.fromkeys([f_item for f_item in fields_list if f_item]))  # type: ignore
+        unique_fields = []
+        for f_item in fields_list:  # type: ignore
+            if f_item and f_item not in unique_fields:
+                unique_fields.append(f_item)
+        current_collected_data["clarification_needed_fields"] = unique_fields  # type: ignore
         if not current_collected_data.get("clarification_needed_fields"):  # type: ignore
             del current_collected_data["clarification_needed_fields"]  # type: ignore
 
@@ -278,6 +319,10 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     logger.info(
         f"extract_initial_info_node: Clarification needed for after extraction: {current_collected_data.get('clarification_needed_fields')}"
     )
+    if current_clarification_context:
+        logger.info(
+            f"extract_initial_info_node: Clarification context set to: {current_clarification_context}"
+        )
 
     return {
         "collected_data": current_collected_data,
@@ -477,18 +522,19 @@ async def get_route_duration(
 # --- Узел 3: Поиск мероприятий ---
 async def search_events_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: search_events_node executing...")
-    collected_data: CollectedUserData = state.get("collected_data", {})  # type: ignore
+    collected_data: CollectedUserData = state.get("collected_data", {})
 
     city_id = collected_data.get("city_id_afisha")
-    parsed_dates_iso = collected_data.get("parsed_dates_iso")
+    parsed_dates_iso_list = collected_data.get("parsed_dates_iso")
+    parsed_end_dates_iso_list = collected_data.get("parsed_end_dates_iso")
     interests_keys = collected_data.get(
         "interests_keys_afisha", collected_data.get("interests_original")
     )
     budget = collected_data.get("budget_current_search")
 
-    if not city_id or not parsed_dates_iso or not interests_keys:
+    if not city_id or not parsed_dates_iso_list or not interests_keys:
         logger.error(
-            f"search_events_node: Missing critical data for event search. CityID: {city_id}, Dates: {parsed_dates_iso}, Interests: {interests_keys}"
+            f"search_events_node: Missing critical data. CityID: {city_id}, Dates: {parsed_dates_iso_list}, Interests: {interests_keys}"
         )
         return {
             "current_events": [],
@@ -497,17 +543,60 @@ async def search_events_node(state: AgentState) -> Dict[str, Any]:
         }
 
     try:
-        date_from_dt = datetime.fromisoformat(parsed_dates_iso[0])
-        date_to_dt = (
-            datetime.fromisoformat(parsed_dates_iso[1])
-            if len(parsed_dates_iso) > 1
-            else (
-                datetime.fromisoformat(parsed_dates_iso[0]) + timedelta(days=1)
-            ).replace(hour=0, minute=0, second=0, microsecond=0)
+        date_from_dt_extracted = datetime.fromisoformat(parsed_dates_iso_list[0])
+        user_explicitly_provided_time = not (
+            date_from_dt_extracted.hour == 0
+            and date_from_dt_extracted.minute == 0
+            and date_from_dt_extracted.second == 0
+            and date_from_dt_extracted.microsecond == 0
         )
+        api_date_from = date_from_dt_extracted.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        api_date_to_date_obj = api_date_from.date() + timedelta(days=1)
+        api_date_to = datetime(
+            api_date_to_date_obj.year,
+            api_date_to_date_obj.month,
+            api_date_to_date_obj.day,
+            0,
+            0,
+            0,
+        )
+
+        max_start_dt_extracted: Optional[datetime] = None
+        if parsed_end_dates_iso_list and parsed_end_dates_iso_list[0]:
+            try:
+                max_start_dt_extracted = datetime.fromisoformat(
+                    parsed_end_dates_iso_list[0]
+                )
+                logger.info(
+                    f"search_events_node: Max start time extracted: {max_start_dt_extracted.isoformat()}"
+                )
+            except (ValueError, TypeError) as e_max_date:
+                logger.warning(
+                    f"search_events_node: Could not parse parsed_end_dates_iso: {parsed_end_dates_iso_list[0]}. Error: {e_max_date}"
+                )
+
+        logger.info(
+            f"search_events_node: Date from (extracted with time): {date_from_dt_extracted.isoformat()}"
+        )
+        if max_start_dt_extracted:
+            logger.info(
+                f"search_events_node: Max start time for search (extracted): {max_start_dt_extracted.isoformat()}"
+            )
+        logger.info(
+            f"search_events_node: User explicitly provided time (hour/minute != 00:00): {user_explicitly_provided_time}"
+        )
+        logger.info(
+            f"search_events_node: API Date From (for Afisha query): {api_date_from.isoformat()}"
+        )
+        logger.info(
+            f"search_events_node: API Date To (for Afisha query): {api_date_to.isoformat()}"
+        )
+
     except (ValueError, IndexError, TypeError) as e:
         logger.error(
-            f"search_events_node: Error parsing dates from ISO strings {parsed_dates_iso}: {e}",
+            f"search_events_node: Error parsing dates from ISO strings {parsed_dates_iso_list}: {e}",
             exc_info=True,
         )
         return {
@@ -516,102 +605,228 @@ async def search_events_node(state: AgentState) -> Dict[str, Any]:
             "is_initial_plan_proposed": False,
         }
 
-    tool_args = EventSearchToolArgs(
-        city_id=city_id,
-        date_from=date_from_dt,
-        date_to=date_to_dt,
-        interests_keys=interests_keys,
-        min_start_time_naive=None,
-        max_budget_per_person=budget,
-        exclude_session_ids=None,
-    )
+    found_events_obj_list: List[Event] = []
 
-    logger.info(
-        f"search_events_node: Calling event_search_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
-    )
+    async def _perform_search_internal(
+        search_min_start_time_naive: Optional[datetime],
+        search_max_start_time_naive: Optional[datetime],
+    ) -> List[Event]:
+        tool_args = EventSearchToolArgs(
+            city_id=city_id,
+            date_from=api_date_from,
+            date_to=api_date_to,
+            interests_keys=interests_keys,
+            min_start_time_naive=search_min_start_time_naive,
+            max_start_time_naive=search_max_start_time_naive,
+            max_budget_per_person=budget,
+            exclude_session_ids=None,
+        )
+        logger.info(
+            f"search_events_node (_perform_search_internal): Calling event_search_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
+        )
+        try:
+            events_dict_list: List[Dict] = await event_search_tool.ainvoke(
+                tool_args.model_dump(exclude_none=True)
+            )
+            internal_list: List[Event] = []
+            if events_dict_list:
+                logger.info(
+                    f"search_events_node (_perform_search_internal): Received {len(events_dict_list)} raw events from tool."
+                )
+                for evt_data in events_dict_list:
+                    try:
+                        internal_list.append(Event(**evt_data))
+                    except Exception as val_err:
+                        logger.warning(
+                            f"search_events_node (_perform_search_internal): Validation error for event data: {evt_data.get('session_id', 'Unknown_ID')}. Error: {val_err}"
+                        )
+            else:
+                logger.info(
+                    "search_events_node (_perform_search_internal): Received 0 raw events from tool."
+                )
+            return internal_list
+        except Exception as e_search:
+            logger.error(
+                f"search_events_node (_perform_search_internal): Error calling event_search_tool: {e_search}",
+                exc_info=True,
+            )
+            return []
 
-    try:
-        events_dict_list: List[Dict] = await event_search_tool.ainvoke(
-            tool_args.model_dump(exclude_none=True)
+    if user_explicitly_provided_time:
+        logger.info(
+            f"search_events_node: Stage 1 - User specified time. Searching with min_start_time_naive={date_from_dt_extracted.isoformat()}"
+            + (
+                f" and max_start_time_naive={max_start_dt_extracted.isoformat()}"
+                if max_start_dt_extracted
+                else ""
+            )
         )
-        current_events_obj_list: List[Event] = []
-        if events_dict_list:
-            for evt_data in events_dict_list:
-                try:
-                    current_events_obj_list.append(Event(**evt_data))
-                except Exception as val_err:
-                    logger.warning(
-                        f"search_events_node: Validation error for event data: {evt_data.get('session_id', 'Unknown_ID')}. Error: {val_err}"
-                    )
-    except Exception as e:
-        logger.error(
-            f"search_events_node: Error calling event_search_tool: {e}", exc_info=True
+        found_events_obj_list = await _perform_search_internal(
+            search_min_start_time_naive=date_from_dt_extracted,
+            search_max_start_time_naive=max_start_dt_extracted,
         )
-        status_msg = "Произошла ошибка при поиске мероприятий. Попробуйте позже или измените запрос."
+        logger.info(
+            f"search_events_node: Stage 1 - Found {len(found_events_obj_list)} events."
+        )
+
+    if not user_explicitly_provided_time and not found_events_obj_list:
+        logger.info(
+            "search_events_node: Stage 2 - User did not specify time. Attempting default evening (17:00)."
+        )
+        default_evening_start_time = api_date_from.replace(hour=17, minute=0)
+        found_events_obj_list = await _perform_search_internal(
+            search_min_start_time_naive=default_evening_start_time,
+            search_max_start_time_naive=max_start_dt_extracted,  # Если пользователь сказал "вечером до 20", то max_start_dt_extracted будет, иначе None
+        )
+        logger.info(
+            f"search_events_node: Stage 2 - Found {len(found_events_obj_list)} events."
+        )
+
+    if not found_events_obj_list:
+        logger.info(
+            "search_events_node: Stage 3 - Still no events (or skipped previous stages). Attempting search for the whole day."
+        )
+        found_events_obj_list = await _perform_search_internal(
+            search_min_start_time_naive=None, search_max_start_time_naive=None
+        )
+        logger.info(
+            f"search_events_node: Stage 3 - Found {len(found_events_obj_list)} events."
+        )
+
+    if not found_events_obj_list:
+        logger.info("search_events_node: No events found by tool after all attempts.")
         return {
             "current_events": [],
-            "status_message_to_user": status_msg,
+            "status_message_to_user": None,
             "is_initial_plan_proposed": False,
         }
 
-    if not current_events_obj_list:
-        logger.info("search_events_node: No events found by tool.")
-        search_criteria_summary = f"город: {collected_data.get('city_name')}, даты: {parsed_dates_iso}, интересы: {interests_keys}"
-        status_msg = f"К сожалению, по вашим критериям ({search_criteria_summary}) ничего не нашлось. Может, попробуем другие даты или интересы?"
-        return {
-            "current_events": [],
-            "status_message_to_user": status_msg,
-            "is_initial_plan_proposed": False,
-        }
-
-    # --- Новый алгоритм: Учитываем время окончания первого + дорогу до второго через 2ГИС ---
-    # 1. Берём первое событие как отправную точку
-    first_event = current_events_obj_list[0]
+    first_event = found_events_obj_list[0]
     events_to_propose = [first_event]
 
-    first_event_end = first_event.start_time_naive_event_tz
-    if first_event.duration_minutes:
-        first_event_end += timedelta(minutes=first_event.duration_minutes)
-    else:
-        # Если нет duration — берём плюс 2 часа как дефолт
-        first_event_end += timedelta(hours=2)
+    if len(found_events_obj_list) > 1:
+        first_event_end_naive = first_event.start_time_naive_event_tz
+        if first_event.duration_minutes:
+            first_event_end_naive += timedelta(minutes=first_event.duration_minutes)
+        else:
+            first_event_end_naive += timedelta(hours=2)
 
-    # 2. Пытаемся подобрать второе мероприятие, чтобы успеть после первого (учитывая дорогу)
-    for candidate in current_events_obj_list[1:]:
-        # Время между первым и кандидатом
-        route_duration = None
+        for candidate_event in found_events_obj_list[1:]:
+            if not (
+                first_event.place_coords_lon
+                and first_event.place_coords_lat
+                and candidate_event.place_coords_lon
+                and candidate_event.place_coords_lat
+            ):
+                logger.warning(
+                    f"search_events_node: Skipping candidate {candidate_event.session_id} due to missing coordinates for route calculation."
+                )
+                continue
+            try:
+                route_result = await get_route(
+                    points=[
+                        {
+                            "lon": first_event.place_coords_lon,
+                            "lat": first_event.place_coords_lat,
+                        },
+                        {
+                            "lon": candidate_event.place_coords_lon,
+                            "lat": candidate_event.place_coords_lat,
+                        },
+                    ],
+                    transport="driving",
+                )
+                route_duration_seconds = 0
+                if route_result and route_result.get("status") == "success":
+                    route_duration_seconds = route_result.get("duration_seconds", 0)
+                else:
+                    error_msg = (
+                        route_result.get("message", "unknown error")
+                        if route_result
+                        else "no response"
+                    )
+                    logger.warning(
+                        f"search_events_node: Could not get route duration between {first_event.session_id} and {candidate_event.session_id} (Error: {error_msg}). Assuming 30 min for check."
+                    )
+                    route_duration_seconds = 30 * 60
+                route_duration_minutes = route_duration_seconds / 60
+            except Exception as e_route:
+                logger.error(
+                    f"search_events_node: Error calling get_route: {e_route}",
+                    exc_info=True,
+                )
+                route_duration_minutes = 30
 
-        # --- Здесь вызов 2ГИС для оценки времени в пути (асинхронный) ---
-        try:
-            # Импортируй/напиши свою функцию, например get_route_duration()
-            route_result = await get_route_duration(
-                from_lon=first_event.place_coords_lon,
-                from_lat=first_event.place_coords_lat,
-                to_lon=candidate.place_coords_lon,
-                to_lat=candidate.place_coords_lat,
-                transport_type="public_transport",  # Можно менять тип
-                start_time=first_event_end,
+            arrival_at_candidate_naive = first_event_end_naive + timedelta(
+                minutes=route_duration_minutes
             )
-            route_duration = route_result["duration_minutes"]
-        except Exception as e:
-            logger.warning(
-                f"search_events_node: Не удалось получить маршрут через 2ГИС: {e}"
-            )
-            # Если не получилось — пробуем без маршрута, но лучше пропустить такой кандидат
-            continue
+            buffer_time = timedelta(minutes=15)
+            if (
+                arrival_at_candidate_naive
+                <= candidate_event.start_time_naive_event_tz - buffer_time
+            ):
+                events_to_propose.append(candidate_event)
+                if len(events_to_propose) >= 2:
+                    break
+            else:
+                logger.debug(
+                    f"search_events_node: Candidate {candidate_event.session_id} "
+                    f"({candidate_event.name} at {candidate_event.start_time_naive_event_tz.strftime('%H:%M')}) "
+                    f"is not suitable. Arrival from previous event at {arrival_at_candidate_naive.strftime('%H:%M')}. "
+                    f"Need to arrive by {(candidate_event.start_time_naive_event_tz - buffer_time).strftime('%H:%M')} (event start minus buffer)."
+                )
 
-        # Время, когда можно попасть на второе мероприятие
-        arrival_time = first_event_end + timedelta(minutes=route_duration or 0)
-        # Можем ли попасть? Надо чтобы arrival_time <= candidate.start_time_naive_event_tz + запас 5-10 минут
-        if arrival_time <= candidate.start_time_naive_event_tz + timedelta(minutes=10):
-            events_to_propose.append(candidate)
-            break  # Только два события
-
+    logger.info(
+        f"search_events_node: Proposing {len(events_to_propose)} events to the user."
+    )
     return {
         "current_events": events_to_propose,
         "status_message_to_user": None,
         "is_initial_plan_proposed": True,
     }
+
+
+async def _perform_search(
+    current_date_from: datetime,
+    current_date_to: datetime,
+    current_min_start_time: Optional[datetime],
+) -> List[Event]:
+    tool_args = EventSearchToolArgs(
+        city_id=city_id,
+        date_from=current_date_from,  # Используем переданные, а не из state напрямую
+        date_to=current_date_to,  # Используем переданные
+        interests_keys=interests_keys,
+        min_start_time_naive=current_min_start_time,
+        max_budget_per_person=budget,
+        exclude_session_ids=None,  # Добавить логику для исключения, если нужно при повторном поиске
+    )
+    logger.info(
+        f"search_events_node: Calling event_search_tool with args: {tool_args.model_dump_json(indent=2, exclude_none=True)}"
+    )
+    try:
+        events_dict_list: List[Dict] = await event_search_tool.ainvoke(
+            tool_args.model_dump(exclude_none=True)
+        )
+        current_events_obj_list_internal: List[Event] = []
+        if events_dict_list:
+            for evt_data in events_dict_list:
+                try:
+                    current_events_obj_list_internal.append(Event(**evt_data))
+                except Exception as val_err:
+                    logger.warning(
+                        f"search_events_node: Validation error for event data: {evt_data.get('session_id', 'Unknown_ID')}. Error: {val_err}"
+                    )
+        return current_events_obj_list_internal
+    except Exception as e_search:
+        logger.error(
+            f"search_events_node: Error calling event_search_tool: {e_search}",
+            exc_info=True,
+        )
+        # Не возвращаем здесь сообщение пользователю, обработаем выше
+        return []
+
+
+# --- Логика двухэтапного поиска ---
 
 
 # --- Узел 4: Представление начального плана и запрос адреса/бюджета ---
