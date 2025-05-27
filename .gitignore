@@ -12,3 +12,5 @@ __pycache__/
 # Игнорировать IDE/редакторские файлы
 .vscode/
 .idea/
+
+proxy_afisha/
