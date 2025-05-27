@@ -652,6 +652,22 @@ async def search_events_node(state: AgentState) -> Dict[str, Any]:
             )
             return []
 
+    # --- Новый блок: определяем min_start_time_naive по времени пользователя ---
+    min_start_time_naive = None
+    if parsed_dates_iso_list:
+        try:
+            date_from_dt_extracted = datetime.fromisoformat(parsed_dates_iso_list[0])
+            # Если пользователь явно указал время (например, 19:00, а не 00:00)
+            if not (
+                date_from_dt_extracted.hour == 0
+                and date_from_dt_extracted.minute == 0
+                and date_from_dt_extracted.second == 0
+                and date_from_dt_extracted.microsecond == 0
+            ):
+                min_start_time_naive = date_from_dt_extracted
+        except Exception as e:
+            logger.error(f"Ошибка парсинга времени пользователя: {e}")
+
     if user_explicitly_provided_time:
         logger.info(
             f"search_events_node: Stage 1 - User specified time. Searching with min_start_time_naive={date_from_dt_extracted.isoformat()}"
