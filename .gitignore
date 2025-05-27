@@ -1,3 +1,16 @@
-# Created by venv; see https://docs.python.org/3/library/venv.html
+
+# Игнорировать файлы окружения
 .env
+
+# Игнорировать кеш-папки и байт-код Python
 __pycache__/
+*.pyc
+
+# Игнорировать временные файлы
+*.log
+*.tmp
+
+# Игнорировать IDE/редакторские файлы
+.vscode/
+.idea/
+proxy_afisha/
