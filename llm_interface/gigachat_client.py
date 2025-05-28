@@ -14,7 +14,7 @@ def get_gigachat_client(tools: Optional[List[BaseTool]] = None) -> GigaChat:
             "credentials": settings.GIGACHAT_CREDENTIALS,
             "scope": settings.GIGACHAT_SCOPE,
             "verify_ssl_certs": False, # Как правило, для локальной разработки
-            "model": "GigaChat-Max", # Модель можно указать здесь или при вызове
+            "model": "GigaChat-Pro", # Модель можно указать здесь или при вызове
             "timeout": 120, # Увеличим общий таймаут для потенциально долгих операций
             "profanity_check": False # Отключаем, если не требуется спецификой задачи
         }
