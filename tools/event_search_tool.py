@@ -6,7 +6,7 @@ from langchain_core.tools import tool
 from pydantic import ValidationError
 
 from schemas.data_schemas import EventSearchToolArgs, Event  # Импортируем наши схемы
-from services.afisha_service import search_sessions_internal  # Наш сервис для Афиши
+from services.afisha_service import search_sessions_internal, filter_events_by_city, fetch_cities_internal
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ async def event_search_tool(
     date_to: datetime,
     interests_keys: Optional[List[str]] = None,
     min_start_time_naive: Optional[datetime] = None,
-    max_start_time_naive: Optional[datetime] = None, # Новый аргумент
+    max_start_time_naive: Optional[datetime] = None,
     max_budget_per_person: Optional[int] = None,
     time_constraints_for_next_event: Optional[Dict[str, datetime]] = None,
     exclude_session_ids: Optional[List[int]] = None,
@@ -34,38 +34,28 @@ async def event_search_tool(
 
     found_events_data = []
     types_to_search = interests_keys if interests_keys else ["ANY"]
-    all_raw_sessions = []
+    all_raw_sessions = await search_sessions_internal(
+        city_id=city_id,
+        date_from=date_from,
+        date_to=date_to,
+        creation_type_key=interests_keys[0] if interests_keys else "ANY",
+        min_start_time_naive=min_start_time_naive,
+        max_start_time_naive=max_start_time_naive,
+        max_budget_per_person=max_budget_per_person,
+        exclude_session_ids=exclude_session_ids,
+    )
 
-    for interest_key in types_to_search:
-        logger.debug(f"EventSearchTool: Searching for interest_key='{interest_key}'")
-        try:
-            raw_sessions = await search_sessions_internal(
-                city_id=city_id,
-                date_from=date_from.date(),
-                date_to=date_to.date(),
-                creation_type_key=interest_key,
-                min_start_time_naive=min_start_time_naive,
-                max_start_time_naive=max_start_time_naive, # Передаем дальше
-                max_budget_per_person=max_budget_per_person,
-                exclude_session_ids=exclude_session_ids,
-            )
-            if raw_sessions:
-                all_raw_sessions.extend(raw_sessions)
-                logger.info(f"EventSearchTool: Found {len(raw_sessions)} raw sessions for interest '{interest_key}'.")
-            else:
-                logger.info(f"EventSearchTool: No raw sessions found for interest '{interest_key}'.")
-        except Exception as e:
-            logger.error(f"EventSearchTool: Error calling afisha_service for interest '{interest_key}': {e}", exc_info=True)
+    # Получаем название города по city_id
+    cities = await fetch_cities_internal()
+    city_name = next((c["name"] for c in cities if int(c["id"]) == int(city_id)), "")
 
-    if not all_raw_sessions:
-        logger.warning("EventSearchTool: No events found after searching all interests.")
-        return []
+    processed_sessions = filter_events_by_city(all_raw_sessions, city_name, city_id=city_id)
+    logger.info(f"EventSearchTool: After city filter, {len(processed_sessions)} sessions remain.")
 
-    processed_sessions = all_raw_sessions
     if time_constraints_for_next_event:
         start_after = time_constraints_for_next_event.get("start_after_naive")
         filtered_by_time_constraints = []
-        for session_data in all_raw_sessions:
+        for session_data in processed_sessions:
             session_start_naive = session_data.get("start_time_naive_event_tz")
             if not isinstance(session_start_naive, datetime):
                 logger.warning(f"EventSearchTool: Skipping session due to invalid start_time_naive_event_tz: {session_data.get('session_id')}")

@@ -202,7 +202,7 @@ async def search_sessions_internal(
 
                         if min_start_time_naive and session_dt_naive_event_tz < min_start_time_naive:
                             continue
-                        
+
                         # Новая фильтрация по max_start_time_naive
                         if max_start_time_naive and session_dt_naive_event_tz > max_start_time_naive:
                             logger.debug(f"Afisha: Filtering out session {session_id} by max_start_time_naive. Session: {session_dt_naive_event_tz}, Max: {max_start_time_naive}")
@@ -212,16 +212,27 @@ async def search_sessions_internal(
                         if max_budget_per_person is not None and min_price is not None and min_price > max_budget_per_person:
                             continue
                         
+                        # --- ДОБАВЬТЕ city_id ---
                         all_found_sessions.append({
-                            "session_id": session_id, "afisha_id": original_creation.get("Id"),
-                            "event_type_key": creation_type_key, "name": original_creation.get("Name", "Название не указано"),
-                            "place_name": place_info.get("Name", "Место не указано"), "place_address": place_address,
-                            "place_coords_lon": place_coords_lon, "place_coords_lat": place_coords_lat,
-                            "start_time_iso": session_datetime_str, "start_time_naive_event_tz": session_dt_naive_event_tz,
-                            "duration_minutes": original_creation.get("Duration"), "duration_description": original_creation.get("DurationDescription"),
-                            "min_price": min_price, "price_text": (f"{int(min_price)} ₽" if min_price is not None else "Цена неизвестна"),
-                            "rating": original_creation.get("Rating"), "age_restriction": original_creation.get("AgeRestriction"),
+                            "session_id": session_id,
+                            "afisha_id": original_creation.get("Id"),
+                            "event_type_key": creation_type_key,
+                            "name": original_creation.get("Name", "Название не указано"),
+                            "place_name": place_info.get("Name", "Место не указано"),
+                            "place_address": place_address,
+                            "place_coords_lon": place_coords_lon,
+                            "place_coords_lat": place_coords_lat,
+                            "start_time_iso": session_datetime_str,
+                            "start_time_naive_event_tz": session_dt_naive_event_tz,
+                            "duration_minutes": original_creation.get("Duration"),
+                            "duration_description": original_creation.get("DurationDescription"),
+                            "min_price": min_price,
+                            "price_text": (f"{int(min_price)} ₽" if min_price is not None else "Цена неизвестна"),
+                            "rating": original_creation.get("Rating"),
+                            "age_restriction": original_creation.get("AgeRestriction"),
+                            "city_id": place_info.get("CityId"),  # <-- Вот это поле!
                         })
+                        logger.info(f"Adding session: {original_creation.get('Name')} | {place_info.get('Name')} | {place_address} | {session_datetime_str}")
             if not cursor:
                 logger.info("Afisha: No more cursor from /page, finished fetching creations.")
                 break
@@ -229,3 +240,35 @@ async def search_sessions_internal(
         all_found_sessions.sort(key=lambda s: s["start_time_naive_event_tz"])
         logger.info(f"Afisha: Total sessions found and filtered: {len(all_found_sessions)}")
         return all_found_sessions
+def filter_events_by_city(events: list[dict], city_name: str, city_id: int = None) -> list[dict]:
+    """
+    Оставляет только те события, которые проходят в указанном городе по CityId и адресу.
+    Исключает сёла, посёлки и т.п., даже если в адресе есть название города.
+    """
+    filtered = []
+    forbidden_prefixes = [
+        "с.", "п.", "дер.", "пос.", "рп.", "ст.", "д.", "село", "поселок", "деревня", "станица"
+    ]
+    city_name_lower = city_name.lower()
+    for event in events:
+        event_city_id = event.get("city_id") or event.get("CityId")
+        if not event_city_id and event.get("place_name"):
+            place_info = event.get("place_info") or {}
+            event_city_id = place_info.get("CityId")
+        address = (event.get("place_address") or "").lower().strip()
+        address_starts = address.split(",")[0]
+
+        # 1. Исключаем по префиксам (село, посёлок и т.д.)
+        if any(address_starts.startswith(prefix) for prefix in forbidden_prefixes):
+            continue
+
+        # 3. Основная фильтрация по CityId
+        if city_id and event_city_id and int(event_city_id) == int(city_id):
+            filtered.append(event)
+            continue
+
+        # 4. Фолбэк: если нет CityId, фильтруем по названию города в адресе
+        if city_name_lower in address:
+            filtered.append(event)
+    logger.info(f"filter_events_by_city: {len(filtered)} из {len(events)} событий после фильтрации по CityId '{city_id}' и адресу")
+    return filtered
