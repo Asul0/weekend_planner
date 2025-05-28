@@ -47,47 +47,17 @@ class CollectedUserData(TypedDict, total=False):
 
 
 class AgentState(TypedDict):
-    """
-    Полное состояние графа агента.
-    """
-
-    messages: Annotated[List[BaseMessage], add_messages]  # История диалога
-
-    collected_data: CollectedUserData  # Собранные и обработанные данные от пользователя
-
-    current_events: Optional[
-        List[Event]
-    ]  # Список предложенных мероприятий (объекты Event)
-    # Храним весь объект RouteDetails, который включает статус, длительность, расстояние и т.д.
+    messages: Annotated[List[BaseMessage], add_messages]
+    collected_data: CollectedUserData
+    current_events: Optional[List[Event]]
     current_route_details: Optional[RouteDetails]
-
-    # Управленческие поля для потока диалога
-    status_message_to_user: Optional[
-        str
-    ]  # Сообщение, которое нужно показать пользователю следующим
-
-    # Поле для указания, какая информация требует уточнения
-    # Может быть строкой (ключ из CollectedUserData) или списком строк
+    status_message_to_user: Optional[str]
     clarification_needed_fields: Optional[List[str]]
-    # Контекст для уточнения, например, предложенный вариант от LLM
     clarification_context: Optional[Any]
-
-    # Флаги для управления логикой
-    is_initial_plan_proposed: (
-        bool  # Был ли предложен первоначальный план с мероприятиями
-    )
-    is_full_plan_with_route_proposed: bool  # Был ли предложен полный план с маршрутом
-    awaiting_final_confirmation: (
-        bool  # Ожидаем ли финального подтверждения плана от пользователя
-    )
-
-    # Для обработки изменений плана
-    # Может содержать информацию о том, какое мероприятие меняется, новые критерии и т.д.
-    # Структура этого поля может быть уточнена при реализации узла handle_plan_feedback_node
+    awaiting_clarification_for_field: Optional[str] 
+    is_initial_plan_proposed: bool
+    is_full_plan_with_route_proposed: bool
+    awaiting_final_confirmation: bool
     pending_plan_modification_request: Optional[Dict[str, Any]]
-
-    # Для хранения предыдущего состояния при запросе подтверждения изменений (пример 2 из инструкции)
-    # Это позволит откатиться или использовать подтвержденные ранее данные.
-    # Можно хранить только нужные части state, а не весь state целиком.
     previous_confirmed_collected_data: Optional[CollectedUserData]
     previous_confirmed_events: Optional[List[Event]]
