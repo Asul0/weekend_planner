@@ -1,20 +1,276 @@
+# Файл: tools/datetime_parser_tool.py
 import logging
-from datetime import datetime, date, timedelta
-from typing import Optional, Dict, Union
-from schemas.data_schemas import ParsedDateTime, DateTimeParserToolArgs
-from pydantic import BaseModel, Field
+from datetime import datetime, timedelta
+from typing import Optional, Dict, Union, Tuple
+
+import dateparser
+from pydantic import BaseModel, Field  # <--- ДОБАВИЛИ Field
 from langchain_core.tools import tool
-from pydantic import BaseModel, Field
 
 from llm_interface.gigachat_client import get_gigachat_client
-from schemas.data_schemas import (
-    DateTimeParserToolArgs,
-)  # Импортируем нашу схему аргументов
+from schemas.data_schemas import ParsedDateTime, DateTimeParserToolArgs
 
 logger = logging.getLogger(__name__)
+# logger.setLevel(logging.DEBUG) # Раскомментируй для детальных логов этого модуля
 
 
-# Pydantic модель для структурированного ответа от LLM
+def _calculate_weekend_dates_simple(
+    base_dt: datetime, next_weekend: bool = False
+) -> Tuple[datetime, datetime]:
+    days_to_monday = base_dt.weekday()
+    if next_weekend:
+        start_of_next_week_monday = (
+            base_dt - timedelta(days=days_to_monday) + timedelta(days=7)
+        )
+        saturday = start_of_next_week_monday + timedelta(days=5)
+    else:
+        if base_dt.weekday() >= 5:
+            saturday = base_dt - timedelta(days=(base_dt.weekday() - 5))
+        else:
+            saturday = base_dt + timedelta(days=(5 - base_dt.weekday()))
+    sunday = saturday + timedelta(days=1)
+    return (
+        saturday.replace(hour=0, minute=0, second=0, microsecond=0),
+        sunday.replace(hour=0, minute=0, second=0, microsecond=0),
+    )
+
+
+def _calculate_specific_weekday(
+    base_dt: datetime, target_weekday_iso: int, is_next_week_explicit: bool = False
+) -> datetime:
+    current_weekday_iso = base_dt.weekday()
+    days_difference = (target_weekday_iso - current_weekday_iso + 7) % 7
+    result_dt = base_dt + timedelta(days=days_difference)
+
+    if is_next_week_explicit:
+        if result_dt.isocalendar()[1] == base_dt.isocalendar()[1]:
+            result_dt += timedelta(days=7)
+        elif (
+            result_dt.date() == base_dt.date()
+            and target_weekday_iso == current_weekday_iso
+        ):
+            result_dt += timedelta(days=7)
+    elif result_dt.date() < base_dt.date():
+        result_dt += timedelta(days=7)
+
+    return result_dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+async def _parse_time_with_llm(
+    time_qualifier: str, base_datetime_for_time_prompt: datetime, llm_instance
+) -> Tuple[Optional[int], Optional[int]]:
+    if not time_qualifier:
+        return None, None
+
+    logger.debug(f"_parse_time_with_llm: Парсинг времени='{time_qualifier}'")
+
+    class TimeResult(BaseModel):
+        """Извлекает час и минуту из текстового описания времени."""
+
+        hour: Optional[int] = Field(
+            None, description="Извлеченный час в 24-часовом формате (0-23)."
+        )
+        minute: Optional[int] = Field(
+            None,
+            description="Извлеченные минуты (0-59). Если не указаны, должно быть 0, если час указан.",
+        )
+
+    time_prompt_content = f"""
+Извлеки час и минуту из следующего описания времени: "{time_qualifier}".
+Контекстная дата: {base_datetime_for_time_prompt.strftime('%Y-%m-%d')}.
+"утром" = 9:00. "днем" или "в обед" = 13:00. "вечером" = 18:00.
+"в X часов", "X часов" - извлеки X как hour, minute должно быть 0.
+"X:YY" - извлеки X как hour и YY как minute.
+"с X до Y" - извлеки X (час и минуту) как начальное время.
+Верни результат, используя предоставленную структуру TimeResult.
+Если час указан, а минуты нет, верни minute: 0.
+Если не можешь извлечь валидный час, верни hour: null и minute: null.
+"""
+    try:
+        structured_llm_time = llm_instance.with_structured_output(TimeResult)
+        time_parsed_response = await structured_llm_time.ainvoke(time_prompt_content)
+
+        if isinstance(time_parsed_response, TimeResult):
+            time_parsed = time_parsed_response
+            if time_parsed.hour is not None and time_parsed.minute is None:
+                time_parsed.minute = 0
+        else:
+            logger.error(
+                f"_parse_time_with_llm: Неожиданный тип ответа: {type(time_parsed_response)}"
+            )
+            return None, None
+
+        logger.debug(
+            f"_parse_time_with_llm: LLM результат для времени: {time_parsed.model_dump_json(indent=2)}"
+        )
+        if time_parsed.hour is not None and time_parsed.minute is not None:
+            return time_parsed.hour, time_parsed.minute
+        else:
+            return None, None
+    except Exception as e:
+        logger.error(
+            f"_parse_time_with_llm: Ошибка парсинга времени '{time_qualifier}': {e}",
+            exc_info=True,
+        )
+        return None, None
+
+
+def _apply_time_to_datetime(
+    dt: datetime, hour: Optional[int], minute: Optional[int]
+) -> datetime:
+    if hour is not None and minute is not None:
+        try:
+            return dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        except ValueError as e:
+            logger.warning(f"Не удалось применить время {hour}:{minute} к {dt}: {e}")
+            return dt
+    return dt
+
+
+def python_date_parser(
+    natural_language_date: str, base_datetime: datetime
+) -> Optional[Dict[str, Union[datetime, bool, str, None]]]:
+    nl_date_lower = natural_language_date.lower().strip()
+    logger.debug(
+        f"python_date_parser: Вход: nl_date_lower='{nl_date_lower}', base_datetime='{base_datetime.isoformat()}'"
+    )
+
+    parsed_info: Dict[str, Union[datetime, bool, str, None]] = {
+        "start_datetime": None,
+        "end_datetime": None,
+        "is_range": False,
+        "is_ambiguous": False,
+        "source": "python_direct",
+        "clarification_needed": None,
+    }
+    start_dt: Optional[datetime] = None
+
+    if not nl_date_lower:
+        return None
+
+    if nl_date_lower == "сегодня" or nl_date_lower == "на сегодня":
+        start_dt = base_datetime
+    elif nl_date_lower == "завтра" or nl_date_lower == "на завтра":
+        start_dt = base_datetime + timedelta(days=1)
+    elif nl_date_lower == "послезавтра" or nl_date_lower == "на послезавтра":
+        start_dt = base_datetime + timedelta(days=2)
+
+    if start_dt:
+        parsed_info["start_datetime"] = start_dt.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        logger.debug(
+            f"python_date_parser (direct): Распознано '{nl_date_lower}' -> {parsed_info['start_datetime']}"
+        )
+        return parsed_info
+
+    if any(
+        kw in nl_date_lower
+        for kw in [
+            "эти выходные",
+            "на выходных",
+            "текущие выходные",
+            "ближайшие выходные",
+        ]
+    ):
+        saturday, sunday = _calculate_weekend_dates_simple(
+            base_datetime, next_weekend=False
+        )
+        parsed_info["start_datetime"] = saturday
+        parsed_info["end_datetime"] = sunday.replace(hour=23, minute=59, second=59)
+        parsed_info["is_range"] = True
+        logger.debug(
+            f"python_date_parser (direct): Распознаны 'эти выходные' -> СБ={saturday}, ВС={sunday}"
+        )
+        return parsed_info
+
+    if any(kw in nl_date_lower for kw in ["следующие выходные"]):
+        saturday, sunday = _calculate_weekend_dates_simple(
+            base_datetime, next_weekend=True
+        )
+        parsed_info["start_datetime"] = saturday
+        parsed_info["end_datetime"] = sunday.replace(hour=23, minute=59, second=59)
+        parsed_info["is_range"] = True
+        logger.debug(
+            f"python_date_parser (direct): Распознаны 'следующие выходные' -> СБ={saturday}, ВС={sunday}"
+        )
+        return parsed_info
+
+    weekday_search_forms = {
+        "понедельник": 0,
+        "понедельника": 0,
+        "вторник": 1,
+        "вторника": 1,
+        "среду": 2,
+        "среды": 2,
+        "четверг": 3,
+        "четверга": 3,
+        "пятницу": 4,
+        "пятницы": 4,
+        "субботу": 5,
+        "субботы": 5,
+        "воскресенье": 6,
+        "воскресенья": 6,
+    }
+    is_next_week_explicit = "следующ" in nl_date_lower
+    matched_day_iso = None
+    for form, day_iso in weekday_search_forms.items():
+        if form in nl_date_lower:
+            if ("выходные" in nl_date_lower or "уикенд" in nl_date_lower) and (
+                form == "субботу" or form == "воскресенье"
+            ):
+                continue
+            matched_day_iso = day_iso
+            break
+    if matched_day_iso is not None:
+        start_dt = _calculate_specific_weekday(
+            base_datetime, matched_day_iso, is_next_week_explicit
+        )
+        parsed_info["start_datetime"] = start_dt
+        parsed_info["source"] = "python_weekday_logic"
+        logger.debug(
+            f"python_date_parser (weekday_logic): Распознано '{natural_language_date}' -> {start_dt}"
+        )
+        return parsed_info
+
+    logger.debug(
+        f"python_date_parser: Попытка парсинга с dateparser для: '{natural_language_date}'"
+    )
+    settings = {"PREFER_DATES_FROM": "future", "RELATIVE_BASE": base_datetime}
+    try:
+        dp_result = dateparser.parse(
+            natural_language_date, languages=["ru"], settings=settings
+        )
+        if dp_result:
+            parsed_info["start_datetime"] = dp_result
+            parsed_info["source"] = "dateparser"
+            logger.debug(
+                f"python_date_parser (dateparser): Распознано '{natural_language_date}' -> {dp_result}"
+            )
+            if (
+                dp_result.year is None
+                or dp_result.month is None
+                or dp_result.day is None
+            ):
+                logger.warning(
+                    "python_date_parser: dateparser вернул None для Y/M/D. Не используем."
+                )
+                return None
+            return parsed_info
+        else:
+            logger.debug(
+                f"python_date_parser: dateparser не смог распознать '{natural_language_date}'."
+            )
+    except Exception as e:
+        logger.error(
+            f"python_date_parser: Ошибка dateparser для '{natural_language_date}': {e}",
+            exc_info=True,
+        )
+
+    logger.debug(
+        f"python_date_parser: Не удалось распознать '{natural_language_date}' Python-методами."
+    )
+    return None
 
 
 @tool("datetime_parser_tool", args_schema=DateTimeParserToolArgs)
@@ -24,264 +280,143 @@ async def datetime_parser_tool(
     base_date_iso: Optional[str] = None,
 ) -> Dict[str, Optional[Union[str, bool, None]]]:
     logger.info(
-        f"DateTimeParserTool: Parsing date='{natural_language_date}', time_qualifier='{natural_language_time_qualifier}' with base_date_iso='{base_date_iso}'"
+        f"DateTimeParserTool: Вход: date='{natural_language_date}', "
+        f"time_qualifier='{natural_language_time_qualifier}', base_date_iso='{base_date_iso}'"
     )
-
-    llm = get_gigachat_client()
-
     current_datetime_base = datetime.now()
     if base_date_iso:
         try:
             current_datetime_base = datetime.fromisoformat(base_date_iso)
         except ValueError:
             logger.warning(
-                f"DateTimeParserTool: Invalid base_date_iso format '{base_date_iso}'. Using current datetime."
+                f"Неверный base_date_iso '{base_date_iso}'. Используется now()."
             )
 
-    base_year = current_datetime_base.year
-    base_month = current_datetime_base.month
-    base_day = current_datetime_base.day
-    base_weekday_iso = current_datetime_base.weekday()  # Понедельник 0, Воскресенье 6
-
-    base_date_for_prompt_str = current_datetime_base.strftime("%Y-%m-%d (%A, %d %B %Y)")
-
-    full_description_for_llm = natural_language_date
-    if natural_language_time_qualifier:
-        full_description_for_llm += f" ({natural_language_time_qualifier})"
-
-    logger.debug(
-        f"DateTimeParserTool: Combined description for LLM: '{full_description_for_llm}'"
-    )
-
-    system_prompt = f"""
-Ты - эксперт по точному распознаванию и вычислению дат и времени из текста. Твоя задача - извлечь или ВЫЧИСЛИТЬ дату и время из предоставленного текста и вернуть их в структурированном виде, используя JSON, соответствующий схеме ParsedDateTime.
-Обязательно вычисляй относительные даты на основе предоставленной базовой даты.
-
-Базовая дата для вычислений: {base_year}-{base_month:02d}-{base_day:02d} (год-месяц-день).
-День недели базовой даты (ISO, где понедельник=0, воскресенье=6): {base_weekday_iso}.
-
-Входной текст: "{full_description_for_llm}"
-
-Проанализируй входной текст. Если есть относительные указания даты, ВЫЧИСЛИ их:
-- "сегодня": Используй {base_year}, {base_month}, {base_day}.
-- "завтра": Это ({base_year}-{base_month:02d}-{base_day:02d} + 1 день). Вычисли и верни точные year, month, day.
-- "послезавтра": Это ({base_year}-{base_month:02d}-{base_day:02d} + 2 дня). Вычисли и верни точные year, month, day.
-- "на этих выходных" или "эти выходные":
-    - Определи ближайшую субботу.
-    - Если базовая дата - суббота ({base_weekday_iso} == 5), то суббота это {base_year}-{base_month:02d}-{base_day:02d}.
-    - Если базовая дата - воскресенье ({base_weekday_iso} == 6), то "эти выходные" это {base_year}-{base_month:02d}-{base_day:02d} (т.е. сама базовая дата, если запрос о воскресенье). Если запрос о субботе, то это прошедшая суббота (base_date - 1 день).
-    - Если базовая дата - будний день (Пн-Пт, {base_weekday_iso} < 5): ближайшая суббота это ({base_year}-{base_month:02d}-{base_day:02d} + {5 - base_weekday_iso} дней).
-    - Верни year, month, day для этой вычисленной субботы.
-    - Если текст явно указывает на весь диапазон выходных (например, "на все выходные", "сб и вс"), то дополнительно вычисли end_year, end_month, end_day для воскресенья (вычисленная суббота + 1 день) и установи end_hour=23, end_minute=59. В остальных случаях, если не указан явный диапазон, касающийся воскресенья, поля end_* оставь null.
-- "в следующие выходные":
-    - Ближайший понедельник после базовой даты это ({base_year}-{base_month:02d}-{base_day:02d} + {(7 - base_weekday_iso) % 7} дней).
-    - Суббота следующей недели это (этот понедельник + 5 дней). Вычисли и верни year, month, day для этой субботы.
-    - Если нужен весь диапазон следующих выходных, то end_year, end_month, end_day будут для воскресенья (суббота следующей недели + 1 день), end_hour=23, end_minute=59.
-
-Если ты успешно ВЫЧИСЛИЛ или извлек конкретную дату (year, month, day), установи is_ambiguous = false.
-Если ты НЕ СМОГ ВЫЧИСЛИТЬ или извлечь однозначные year, month, day (например, текст "в июле" без года, или "в субботу" без контекста, или если ты сомневаешься в вычислении "выходных" из-за неясности запроса), ТОЛЬКО ТОГДА установи is_ambiguous = true, clarification_needed с твоим вопросом, и ОБЯЗАТЕЛЬНО верни year, month, day как null.
-
-Для времени:
-- Если указано конкретное время (например, "в 10:00", "7 вечера" (это 19:00)), извлеки час и минуту.
-- "после X часов" (например, "после 18:00") означает час=X, минута=0.
-- "утром" означает час=9, минута=0. "днем" означает час=13, минута=0. "вечером" означает час=17, минута=0.
-- Если есть явный диапазон (например, "с 17:00 по 21:00"), извлеки hour/minute начала и end_hour/end_minute конца.
-- Если время не указано, час=0, минута=0.
-
-Правила для явных дат (типа "15 июля"):
-- Если год не указан, используй год из базовой даты ({base_year}). Если дата (день.месяц) в текущем году ({base_year}) уже прошла, используй следующий год ({base_year + 1}).
-- Если распознано только время без явной даты, используй год, месяц, день из базовой даты.
-
-Всегда возвращай результат в формате JSON, соответствующий схеме ParsedDateTime. Поля, которые не удалось извлечь, должны быть null.
-"""
-
-    try:
-        structured_llm = llm.with_structured_output(ParsedDateTime)
-        parsed_result: ParsedDateTime = await structured_llm.ainvoke(system_prompt)
-        logger.debug(
-            f"DateTimeParserTool: LLM raw parsed result: {parsed_result.model_dump_json(indent=2)}"
+    python_parsed_date_info = None
+    if natural_language_date:
+        python_parsed_date_info = python_date_parser(
+            natural_language_date, current_datetime_base
         )
 
-        if parsed_result.error_message:
-            logger.warning(
-                f"DateTimeParserTool: LLM error for '{full_description_for_llm}': {parsed_result.error_message}"
-            )
-            return {
-                "datetime_iso": None,
-                "end_datetime_iso": None,
-                "is_ambiguous": True,
-                "clarification_needed": parsed_result.clarification_needed,
-                "error_message": parsed_result.error_message,
-            }
+    if python_parsed_date_info and python_parsed_date_info.get("start_datetime"):
+        start_dt_py: datetime = python_parsed_date_info["start_datetime"]
+        end_dt_py: Optional[datetime] = python_parsed_date_info.get("end_datetime")
 
-        if not (parsed_result.year and parsed_result.month and parsed_result.day):
-            is_only_time_case = (
-                parsed_result.hour is not None and not parsed_result.is_ambiguous
-            )
-            if not is_only_time_case:
+        logger.info(
+            f"DateTimeParserTool: Python-парсер ({python_parsed_date_info['source']}) нашел дату: {start_dt_py.date()}"
+            + (f" - {end_dt_py.date()}" if end_dt_py else "")
+        )
+
+        parsed_hour, parsed_minute = None, None
+        final_time_ambiguous = False
+        final_time_clarification = None
+
+        if natural_language_time_qualifier:
+            if "весь день" in natural_language_time_qualifier.lower():
                 logger.info(
-                    f"DateTimeParserTool: Essential date components (year/month/day) are missing from LLM. Input: '{full_description_for_llm}'. LLM: {parsed_result.model_dump_json(indent=1)}"
+                    "DateTimeParserTool: Обнаружен 'весь день', время остается 00:00 для начала."
                 )
-                clarification = (
-                    parsed_result.clarification_needed
-                    or "Не удалось точно определить дату. Пожалуйста, уточните."
+                start_dt_py = start_dt_py.replace(
+                    hour=0, minute=0
+                )  # Убедимся, что время 00:00
+                if end_dt_py:  # Если это диапазон (выходные), конец остается 23:59
+                    end_dt_py = end_dt_py.replace(hour=23, minute=59, second=59)
+            else:
+                llm_instance_for_time = get_gigachat_client()
+                parsed_hour, parsed_minute = await _parse_time_with_llm(
+                    natural_language_time_qualifier, start_dt_py, llm_instance_for_time
                 )
-                if (
-                    parsed_result.is_ambiguous
-                    and not parsed_result.clarification_needed
-                ):  # Если LLM сам не задал вопрос при неоднозначности
-                    clarification = f"Не удалось однозначно определить дату для '{full_description_for_llm}'. Можете уточнить?"
-                return {
-                    "datetime_iso": None,
-                    "end_datetime_iso": None,
-                    "is_ambiguous": True,
-                    "clarification_needed": clarification,
-                    "error_message": "LLM не предоставил компоненты даты.",
-                }
+                if parsed_hour is not None and parsed_minute is not None:
+                    logger.info(
+                        f"DateTimeParserTool: LLM распарсил время: {parsed_hour:02d}:{parsed_minute:02d} для даты от Python-парсера."
+                    )
+                    start_dt_py = _apply_time_to_datetime(
+                        start_dt_py, parsed_hour, parsed_minute
+                    )
+                else:
+                    logger.info(
+                        f"DateTimeParserTool: LLM не смог распарсить время '{natural_language_time_qualifier}'."
+                    )
+                    final_time_ambiguous = True
+                    final_time_clarification = f"Не удалось точно определить время для '{natural_language_time_qualifier}'. Пожалуйста, уточните время."
+                    start_dt_py = start_dt_py.replace(hour=0, minute=0)
+        else:
+            logger.debug(
+                "DateTimeParserTool: natural_language_time_qualifier не указан, время остается от Python-парсера (обычно 00:00)."
+            )
 
-        year_to_use = (
-            parsed_result.year
-            if parsed_result.year is not None
-            else current_datetime_base.year
+        final_is_ambiguous = (
+            python_parsed_date_info.get("is_ambiguous", False) or final_time_ambiguous
         )
-        month_to_use = (
-            parsed_result.month
-            if parsed_result.month is not None
-            else current_datetime_base.month
-        )
-        day_to_use = (
-            parsed_result.day
-            if parsed_result.day is not None
-            else current_datetime_base.day
+        final_clarification = (
+            python_parsed_date_info.get("clarification_needed")
+            or final_time_clarification
         )
 
-        if not (
-            year_to_use and month_to_use and day_to_use
-        ):  # Дополнительная проверка после подстановки из base_date
-            logger.error(
-                f"DateTimeParserTool: Date components still None after defaults. Y={year_to_use} M={month_to_use} D={day_to_use}. LLM: {parsed_result.model_dump()}"
-            )
-            return {
-                "datetime_iso": None,
-                "end_datetime_iso": None,
-                "is_ambiguous": True,
-                "clarification_needed": "Ошибка при сборке даты.",
-                "error_message": "Внутренняя ошибка сборки даты.",
-            }
+        return {
+            "datetime_iso": (
+                start_dt_py.isoformat() if not final_time_ambiguous else None
+            ),
+            "end_datetime_iso": (
+                end_dt_py.isoformat()
+                if end_dt_py and not final_time_ambiguous
+                else None
+            ),
+            "is_ambiguous": final_is_ambiguous,
+            "clarification_needed": final_clarification,
+            "error_message": None,
+        }
 
-        hour_to_use = parsed_result.hour if parsed_result.hour is not None else 0
-        minute_to_use = parsed_result.minute if parsed_result.minute is not None else 0
-
-        if parsed_result.year is None and not (
-            natural_language_date.lower()
-            in ["сегодня", "завтра", "послезавтра", "вчера", "позавчера"]
-            or "выходн" in natural_language_date.lower()
-        ):
-            try:
-                temp_date_current_year = datetime(
-                    current_datetime_base.year, month_to_use, day_to_use
-                )
-                comparison_base_date_start_of_day = current_datetime_base.replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                )
-                if temp_date_current_year < comparison_base_date_start_of_day:
-                    year_to_use = current_datetime_base.year + 1
-            except (ValueError, TypeError) as e_year_check:
-                logger.warning(
-                    f"DateTimeParserTool: Could not perform 'date passed' check. Y={year_to_use} M={month_to_use} D={day_to_use}. Error: {e_year_check}"
-                )
-                return {
-                    "datetime_iso": None,
-                    "end_datetime_iso": None,
-                    "is_ambiguous": True,
-                    "clarification_needed": "Не удалось точно определить год для указанной даты.",
-                    "error_message": "Ошибка при проверке года.",
-                }
-
-        datetime_iso_str = None
-        end_datetime_iso_str = None
-
-        try:
-            final_start_datetime = datetime(
-                year_to_use, month_to_use, day_to_use, hour_to_use, minute_to_use
-            )
-            datetime_iso_str = final_start_datetime.isoformat()
-
-            if (
-                parsed_result.end_hour is not None
-                and parsed_result.end_minute is not None
-            ):
-                end_year_to_use = (
-                    parsed_result.end_year
-                    if parsed_result.end_year is not None
-                    else year_to_use
-                )
-                end_month_to_use = (
-                    parsed_result.end_month
-                    if parsed_result.end_month is not None
-                    else month_to_use
-                )
-                end_day_to_use = (
-                    parsed_result.end_day
-                    if parsed_result.end_day is not None
-                    else day_to_use
-                )
-
-                final_end_datetime = datetime(
-                    end_year_to_use,
-                    end_month_to_use,
-                    end_day_to_use,
-                    parsed_result.end_hour,
-                    parsed_result.end_minute,
-                )
-                if final_end_datetime < final_start_datetime and not (
-                    parsed_result.end_year
-                    and parsed_result.end_month
-                    and parsed_result.end_day
-                ):
-                    final_end_datetime += timedelta(days=1)
-                end_datetime_iso_str = final_end_datetime.isoformat()
-
-            final_is_ambiguous = parsed_result.is_ambiguous
-            final_clarification_needed = parsed_result.clarification_needed
-            if (
-                final_is_ambiguous and not final_clarification_needed
-            ):  # Если LLM сказал ambiguos, но не дал вопрос
-                final_clarification_needed = f"Не удалось однозначно определить дату для '{full_description_for_llm}'. Можете уточнить?"
-
-            logger.info(
-                f"DateTimeParserTool: Successfully parsed '{full_description_for_llm}' to start='{datetime_iso_str}'"
-                + (f", end='{end_datetime_iso_str}'" if end_datetime_iso_str else "")
-                + f", ambiguous={final_is_ambiguous}"
-            )
-            return {
-                "datetime_iso": datetime_iso_str,
-                "end_datetime_iso": end_datetime_iso_str,
-                "is_ambiguous": final_is_ambiguous,
-                "clarification_needed": final_clarification_needed,
-                "error_message": None,
-            }
-        except (ValueError, TypeError) as e:
-            logger.error(
-                f"DateTimeParserTool: Error constructing datetime from components: Y={year_to_use} M={month_to_use} D={day_to_use} h={hour_to_use} m={minute_to_use}. LLM: {parsed_result.model_dump()}. Error: {e}"
-            )
-            return {
-                "datetime_iso": None,
-                "end_datetime_iso": None,
-                "is_ambiguous": True,
-                "clarification_needed": parsed_result.clarification_needed
-                or "Не удалось собрать корректную дату из распознанных компонентов.",
-                "error_message": f"Ошибка сборки даты: {e}",
-            }
-    except Exception as e:
-        logger.error(
-            f"DateTimeParserTool: Unexpected error for '{full_description_for_llm}': {e}",
-            exc_info=True,
+    if natural_language_date:
+        logger.info(
+            f"DateTimeParserTool: Python-парсер не смог определить дату для '{natural_language_date}'. Запрос на уточнение."
         )
         return {
             "datetime_iso": None,
             "end_datetime_iso": None,
             "is_ambiguous": True,
-            "clarification_needed": "Произошла внутренняя ошибка при распознавании даты.",
-            "error_message": str(e),
+            "clarification_needed": f"Не удалось точно определить дату для \"{natural_language_date}\". Пожалуйста, укажите дату более подробно (например, '15 июня', 'следующий вторник').",
+            "error_message": "Python-парсер не определил дату.",
+        }
+    elif natural_language_time_qualifier:
+        logger.info(
+            f"DateTimeParserTool: Дата не указана, парсим только время '{natural_language_time_qualifier}' с LLM и привязываем к сегодня."
+        )
+        llm_instance = get_gigachat_client()
+        parsed_hour, parsed_minute = await _parse_time_with_llm(
+            natural_language_time_qualifier, current_datetime_base, llm_instance
+        )
+        if parsed_hour is not None and parsed_minute is not None:
+            today_with_time = _apply_time_to_datetime(
+                current_datetime_base, parsed_hour, parsed_minute
+            )
+            logger.info(
+                f"DateTimeParserTool: Распознано только время для сегодня: {today_with_time.isoformat()}"
+            )
+            return {
+                "datetime_iso": today_with_time.isoformat(),
+                "end_datetime_iso": None,
+                "is_ambiguous": False,
+                "clarification_needed": None,
+                "error_message": None,
+            }
+        else:
+            logger.info(
+                f"DateTimeParserTool: Не удалось распознать только время '{natural_language_time_qualifier}'."
+            )
+            return {
+                "datetime_iso": None,
+                "end_datetime_iso": None,
+                "is_ambiguous": True,
+                "clarification_needed": f'Не удалось точно определить время для "{natural_language_time_qualifier}". Пожалуйста, уточните.',
+                "error_message": "LLM не определил время.",
+            }
+    else:
+        logger.warning("DateTimeParserTool: Пустой ввод для даты и времени.")
+        return {
+            "datetime_iso": None,
+            "end_datetime_iso": None,
+            "is_ambiguous": True,
+            "clarification_needed": "Пожалуйста, укажите дату или время.",
+            "error_message": "Пустой ввод.",
         }
