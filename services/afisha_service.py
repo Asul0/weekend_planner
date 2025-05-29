@@ -134,7 +134,7 @@ async def search_sessions_internal(
                 "CityId": city_id,
                 "DateFrom": date_from_str,
                 "DateTo": date_to_str,
-                "Limit": 5,
+                "Limit": 25,
             }
             if actual_creation_type:
                 creations_params["CreationType"] = actual_creation_type
