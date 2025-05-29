@@ -341,7 +341,7 @@ class AnalyzedFeedback(BaseModel):
     )
 
 
-class CollectedUserData(BaseModel):
+
     city_name: Optional[str] = None
     city_id_afisha: Optional[int] = None
     interests_original: Optional[List[str]] = None
@@ -365,6 +365,34 @@ class CollectedUserData(BaseModel):
     previous_confirmed_collected_data: Optional[Dict[str, Any]] = None
     previous_confirmed_events: Optional[List[Dict[str, Any]]] = None
     user_time_desc_for_fallback: Optional[str] = None
+
+
+
+class CollectedUserData(BaseModel): # У тебя это уже BaseModel
+    city_name: Optional[str] = None
+    city_id_afisha: Optional[int] = None
+    interests_original: Optional[List[str]] = None
+    interests_keys_afisha: Optional[List[str]] = None
+    budget_original: Optional[int] = None
+    budget_current_search: Optional[int] = None
+    dates_description_original: Optional[str] = None
+    raw_time_description_original: Optional[str] = None
+    parsed_dates_iso: Optional[List[str]] = None
+    parsed_end_dates_iso: Optional[List[str]] = None
+    user_start_address_original: Optional[str] = None
+    user_start_address_validated_coords: Optional[Dict[str, float]] = None
+    partial_address_street: Optional[str] = Field(default=None, description="Частично распознанная улица, ожидается номер дома.")
+    awaiting_address_input: bool = False # Этот флаг управляется узлами
+    awaiting_fallback_confirmation: bool = False
+    pending_fallback_event: Optional[Dict[str, Any]] = None # Здесь может быть Event.model_dump()
+    last_offered_fallback_for_interest: Optional[str] = None
+    fallback_accepted_and_plan_updated: bool = False
+    not_found_interest_keys_in_primary_search: Optional[List[str]] = None # Интересы, не найденные в ОСНОВНОЕ время
+    fallback_candidates: Optional[Dict[str, Dict[str, Any]]] = None # Словарь {interest_key: event_data_dict}
+    clarification_needed_fields: Optional[List[str]] = Field(default_factory=list)
+    previous_confirmed_collected_data: Optional[Dict[str, Any]] = None 
+    previous_confirmed_events: Optional[List[Dict[str, Any]]] = None
+    user_time_desc_for_fallback: Optional[str] = None # Это поле кажется специфичным, возможно, его можно убрать или переосмыслить
     
     class Config:
-        extra = "allow"
+        extra = "allow" # Оставляем, если нужна гибкость, но лучше все поля объявлять
