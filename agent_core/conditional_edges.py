@@ -19,84 +19,140 @@ def check_initial_data_sufficiency_edge(state: AgentState) -> str:
     collected_data = state.get("collected_data", {})
     clarification_fields = collected_data.get("clarification_needed_fields", [])
     is_initial_plan_proposed = state.get("is_initial_plan_proposed", False)
-    current_events = state.get("current_events", [])
+    # current_events на этом этапе (сразу после extract_initial_info) обычно пусты, если это новый запрос
+    current_events = state.get("current_events", []) 
     user_has_address_coords = bool(collected_data.get("user_start_address_validated_coords"))
     fallback_accepted_and_updated = collected_data.get(
         "fallback_accepted_and_plan_updated", False
     )
-    # Флаг awaiting_address_input теперь не так важен для этого ребра,
-    # т.к. extract_initial_info_node сам решит, что делать, если он ждет адрес.
-    # Важнее, есть ли clarification_fields, и что в них.
 
     logger.debug(
-        f"Edge state values: clarification_fields={clarification_fields}, is_initial_plan_proposed={is_initial_plan_proposed}, fallback_accepted={fallback_accepted_and_updated}, user_has_address_coords={user_has_address_coords}"
+        f"Edge state values (check_initial_data_sufficiency): clarification_fields={clarification_fields}, "
+        f"is_initial_plan_proposed={is_initial_plan_proposed}, "
+        f"fallback_accepted={fallback_accepted_and_updated}, user_has_address_coords={user_has_address_coords}, "
+        f"current_events_count={len(current_events)}"
     )
 
     if clarification_fields:
-        # Если единственное, что нужно уточнить - это адрес, и мы только что его запросили через clarification_context
-        # (например, "Уточните номер дома" или "Не удалось распознать адрес..."),
-        # то extract_initial_info_node уже вернул управление, и граф должен ждать ответа пользователя, т.е. END.
-        # Однако, если clarify_missing_data_node должен задать этот вопрос, то идем туда.
-        # Проверим, есть ли clarification_context, который установил extract_initial_info_node
+        # Эта логика остается, так как уточнения имеют приоритет
         if state.get("clarification_context") and "user_start_address_original" in clarification_fields:
-            logger.info("Edge: Address clarification needed (set by extract_node via context). Routing to 'clarify_missing_data_node' to ask user.")
+            logger.info("Edge (initial_sufficiency): Address clarification needed (set by extract_node via context). Routing to 'clarify_missing_data_node'.")
             return "clarify_missing_data_node"
         
         logger.info(
-            f"Edge: General clarification needed for fields: {clarification_fields}. Routing to 'clarify_missing_data_node'."
+            f"Edge (initial_sufficiency): General clarification needed for fields: {clarification_fields}. Routing to 'clarify_missing_data_node'."
         )
         return "clarify_missing_data_node"
 
+    # Если пользователь только что ответил на предложение fallback
     if fallback_accepted_and_updated:
-        if user_has_address_coords:
-            logger.info(
-                "Edge: Fallback accepted, user has address. Routing to 'clarify_address_or_build_route_node'."
-            )
-            return "clarify_address_or_build_route_node"
-        else:
-            logger.info(
-                "Edge: Fallback accepted, user has NO address. Routing to 'present_initial_plan_node' (to request address)."
-            )
-            # present_initial_plan_node установит awaiting_address_input = True
-            return "present_initial_plan_node"
+        # current_events уже должны быть обновлены в extract_initial_info_node
+        logger.info("Edge (initial_sufficiency): Fallback was just accepted and plan updated.")
+        if user_has_address_coords or not current_events: # Если адрес есть или событий нет (нечего маршрутизировать)
+            logger.info("Routing to 'clarify_address_or_build_route_node' (or skip if no events).")
+            return "clarify_address_or_build_route_node" # build_route проверит current_events
+        else: # Адреса нет, но есть события (включая fallback)
+            logger.info("Routing to 'present_initial_plan_node' (to request address for new plan).")
+            return "present_initial_plan_node" 
 
+    # Если мы уже на этапе, когда начальный план (возможно, цепочка) был предложен,
+    # и пользователь дал новый ввод, который не является ответом на уточнение или fallback.
+    # Например, пользователь просит изменить план, или это просто новый запрос после завершения предыдущего.
+    # `extract_initial_info_node` должен был сбросить is_initial_plan_proposed, если это новый запрос.
+    # Если is_initial_plan_proposed все еще True, это может быть ответ на "Как вам план?".
+    # Эту логику обрабатывает `handle_plan_feedback_node`.
+    # Это условие здесь может быть избыточным, если `extract_initial_info` правильно обрабатывает контекст.
+    # Оставим его, но с комментарием.
     if is_initial_plan_proposed:
-        if not current_events:
-            logger.info(
-                "Edge: Plan was proposed, but now no events. Routing to 'error_node'."
-            )
-            return "error_node"
+        logger.info("Edge (initial_sufficiency): is_initial_plan_proposed is True.")
+        # Если clarification_fields пуст, это значит, что extract_initial_info_node
+        # не нашел новых уточнений и не считает это новым запросом.
+        # Возможно, это ответ на открытый вопрос от present_initial_plan_node ("Как вам план?").
+        # В таком случае, нужно идти на handle_plan_feedback.
+        # Либо, если extract_initial_info_node обработал адрес, то идем на build_route.
         
-        # Если мы здесь, значит, extract_initial_info_node успешно обработал адрес (если его ждали)
-        # или это не был этап ожидания адреса.
-        # clarification_fields пуст.
+        last_message = state.get("messages", [])[-1]
+        # Очень упрощенная проверка, является ли это ответом на "Как вам план?"
+        # Лучше, чтобы present_initial_plan_node устанавливал флаг типа awaiting_plan_feedback
+        if last_message.type == "user" and not collected_data.get("awaiting_fallback_confirmation"):
+             # Проверим, не является ли это ответом на запрос адреса/бюджета от present_initial_plan
+             if state.get("awaiting_clarification_for_field") and \
+                state["awaiting_clarification_for_field"] in ["user_start_address_original", "budget_original"]:
+                 # extract_initial_info обработает это, и мы снова попадем сюда, но уже без awaiting_clarification_for_field
+                 # и, возможно, с user_has_address_coords = True
+                 if user_has_address_coords and state["awaiting_clarification_for_field"] == "user_start_address_original":
+                     logger.info("Edge (initial_sufficiency): Address just provided for existing plan. Routing to 'build_route'.")
+                     return "clarify_address_or_build_route_node" # Имя вашего узла "build_route"
+                 elif state["awaiting_clarification_for_field"] == "budget_original":
+                     logger.info("Edge (initial_sufficiency): Budget just provided. Routing back to 'present_initial_plan_node'.")
+                     return "present_initial_plan_node" # Чтобы перепредложить план или запросить адрес, если нужно
+
+        # Если дошли сюда, и is_initial_plan_proposed=True, но нет явных уточнений,
+        # это может быть неявный фидбек или новый запрос.
+        # Логика здесь сложная, так как extract_initial_info должен был бы сбросить is_initial_plan_proposed
+        # для нового запроса. Если он этого не сделал, возможно, стоит направить на handle_plan_feedback.
+        # Однако, карта графа из graph.txt показывает, что extract_initial_info может вести на handle_plan_feedback.
+        # Это значит, что extract_initial_info сам может решить, что это фидбек.
+        # Поэтому, если clarification_fields пуст, и is_initial_plan_proposed=True,
+        # и мы не на этапе обработки ответа на fallback, то, вероятно, уже можно строить маршрут или показывать план.
         if user_has_address_coords:
-             logger.info(
-                "Edge: Initial plan proposed and user has address. Routing to 'clarify_address_or_build_route_node' for route building."
-            )
-             return "clarify_address_or_build_route_node"
-        else: # Адреса нет, но он и не требовался для clarification_fields
-              # Значит, present_initial_plan_node должен был запросить его, если нужно
-            logger.info(
-                "Edge: Initial plan proposed, address not yet validated or not needed. Routing to 'present_initial_plan_node' to ensure address is handled or to show plan."
-            )
+            logger.info("Edge (initial_sufficiency): Plan was proposed, no new clarifications, user has address. Routing to 'build_route'.")
+            return "clarify_address_or_build_route_node"
+        elif current_events : # План предложен, адреса нет, но есть события
+            logger.info("Edge (initial_sufficiency): Plan was proposed, no new clarifications, no address. Routing to 'present_initial_plan_node' (likely to ask address).")
             return "present_initial_plan_node"
 
 
+    # Основной новый путь: если все данные собраны и уточнений не нужно
     if (
         collected_data.get("city_id_afisha")
         and collected_data.get("parsed_dates_iso")
         and collected_data.get("interests_keys_afisha")
     ):
         logger.info(
-            "Edge: Initial data sufficient for first event search. Routing to 'search_events_node'."
+            "Edge (initial_sufficiency): Initial data sufficient. Routing to 'gather_all_candidate_events_node'."
         )
-        return "search_events_node"
+        return "gather_all_candidate_events_node" # <--- ИЗМЕНЕНИЕ: Идем на сбор всех кандидатов
 
+    # Если ничего из вышеперечисленного не сработало, значит, нужны базовые уточнения
     logger.warning(
-        "Edge: check_initial_data_sufficiency_edge reached fallback state (no conditions met). Defaulting to 'clarify_missing_data_node'."
+        "Edge (initial_sufficiency): Fallback, no conditions met. Defaulting to 'clarify_missing_data_node'."
     )
+    # Добавляем 'clarification_needed_fields', если их нет, чтобы clarify_missing_data_node сработал
+    if not collected_data.get("clarification_needed_fields"):
+        cf = []
+        if not collected_data.get("city_id_afisha"): cf.append("city_name")
+        if not collected_data.get("parsed_dates_iso"): cf.append("dates_description_original")
+        if not collected_data.get("interests_keys_afisha"): cf.append("interests_original")
+        state["collected_data"]["clarification_needed_fields"] = cf if cf else ["city_name"] # хотя бы что-то
+            
     return "clarify_missing_data_node"
+
+
+def check_gathered_candidates_edge(state: AgentState) -> str:
+    logger.debug("Edge: check_gathered_candidates_edge evaluating...")
+    candidate_events = state.get("candidate_events_by_interest", {})
+    requested_interests = state.get("collected_data", {}).get("interests_keys_afisha", [])
+    
+    # Проверяем, есть ли кандидаты хотя бы для одного из запрошенных интересов
+    found_any_candidates = False
+    if candidate_events:
+        for interest_key in requested_interests:
+            if candidate_events.get(interest_key):
+                found_any_candidates = True
+                break
+    
+    if found_any_candidates:
+        logger.info("Edge (gathered_candidates): Candidates found for at least one interest. Routing to 'optimal_chain_constructor_node'.")
+        return "optimal_chain_constructor_node"
+    else:
+        search_errors = state.get("collected_data", {}).get("search_errors_by_interest", {})
+        if search_errors and any(search_errors.values()): # Если были ошибки поиска
+             logger.info("Edge (gathered_candidates): No candidates found, search errors present. Routing to 'error_handler'.")
+        else: # Ошибок не было, но и кандидатов нет
+             logger.info("Edge (gathered_candidates): No candidates found for any requested interest (empty lists). Routing to 'error_handler'.")
+        # error_handler должен будет использовать search_errors_by_interest для более детального сообщения
+        return "error_handler"
 
 def check_event_search_result_edge(state: AgentState) -> str:
     logger.debug("Edge: check_event_search_result_edge evaluating...")
@@ -108,6 +164,26 @@ def check_event_search_result_edge(state: AgentState) -> str:
     else:
         logger.info("Edge: No events found. Routing to 'error_node'.")
         return "error_node"
+
+
+def check_optimal_chain_result_edge(state: AgentState) -> str:
+    logger.debug("Edge: check_optimal_chain_result_edge evaluating...")
+    current_events_chain = state.get("current_events", []) # Это результат optimal_chain_constructor_node
+    unplanned_keys = state.get("unplanned_interest_keys", [])
+    candidate_events_available = state.get("candidate_events_by_interest", {})
+    
+    # Если есть хоть какая-то цепочка ИЛИ есть не вписавшиеся интересы, для которых есть кандидаты (т.е. есть что предложить/обсудить)
+    if current_events_chain or (unplanned_keys and any(candidate_events_available.get(key) for key in unplanned_keys)):
+        logger.info("Edge (optimal_chain_result): Optimal chain constructed or unplanned keys with candidates exist. Routing to 'present_initial_plan_node'.")
+        return "present_initial_plan_node"
+    else:
+        # Цепочки нет, и для не вписавшихся интересов тоже нет кандидатов, или не вписавшихся нет.
+        # Это значит, что либо изначально не было кандидатов (что должно было отсечься раньше),
+        # либо конструктор не смог ничего собрать и для "отказников" тоже ничего нет.
+        logger.info("Edge (optimal_chain_result): No optimal chain and no actionable unplanned keys/candidates. Routing to 'error_handler'.")
+        # error_handler может использовать optimal_chain_construction_message или search_errors_by_interest
+        return "error_handler"
+
 
 def check_address_needs_clarification_or_route_exists_edge(state: AgentState) -> str:
     logger.debug(
