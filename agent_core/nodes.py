@@ -50,150 +50,148 @@ logger = logging.getLogger(__name__)
 # --- Узел 1: Извлечение начальной информации ---
 async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: extract_initial_info_node executing...")
-    awaiting_clarification_field: Optional[str] = state.get(
-        "awaiting_clarification_for_field"
-    )
-    logger.info(
-        f"extract_initial_info_node: Received awaiting_clarification_for_field = '{awaiting_clarification_field}'"
-    )
+    awaiting_clarification_field: Optional[str] = state.get("awaiting_clarification_for_field")
+    logger.info(f"extract_initial_info_node: Received awaiting_clarification_for_field = '{awaiting_clarification_field}'")
 
     messages: List[BaseMessage] = state.get("messages", [])
-    current_collected_data_dict: dict = dict(state.get("collected_data", {}))
+    # Используем dict() для создания изменяемой копии, если collected_data существует, иначе пустой словарь
+    current_collected_data_dict: dict = dict(state.get("collected_data", {})) 
 
-    # Этот флаг теперь будет управляться более точно ниже
-    # current_collected_data_dict["awaiting_address_input"] = False
     clarification_context_for_node: Optional[str] = None
+    # new_clarification_needed будет использоваться для сбора полей, требующих уточнения в этом вызове узла
+    new_clarification_needed_in_this_step: List[str] = []
+
 
     if not messages or not isinstance(messages[-1], HumanMessage):
+        # Если нет сообщений или последнее не от человека (например, первый вызов графа без ввода)
+        # Возвращаем текущее состояние без изменений, но с пустым clarification_context
+        # Это важно, чтобы не зациклиться, если граф вызван без начальных данных
+        logger.warning("extract_initial_info_node: No messages or last message is not HumanMessage. Returning current state.")
+        # Если это первый вход, и мы ожидаем, что пользователь что-то скажет,
+        # то, возможно, граф не должен был сюда попадать без UserMessage.
+        # Однако, если это возможно, нужно гарантировать, что мы не зациклимся на запросе уточнений.
+        # Если clarification_needed_fields уже есть в стейте, они останутся.
+        # Если нет, то и запрашивать нечего.
         return {
             "collected_data": current_collected_data_dict,
             "messages": messages,
-            "awaiting_clarification_for_field": awaiting_clarification_field,
-            "clarification_context": clarification_context_for_node,
+            "clarification_context": None, # Сбрасываем контекст, если он был
+            "awaiting_clarification_for_field": awaiting_clarification_field # Сохраняем, если ждем что-то конкретное
         }
 
     user_query = messages[-1].content.strip()
     user_query_lower = user_query.lower()
 
-    reset_commands = ["новый поиск", "начни сначала", "отмена", "сброс", "стоп"]
+    reset_commands = ["новый поиск", "начни сначала", "отмена", "сброс", "стоп", "reset"]
     if any(cmd in user_query_lower for cmd in reset_commands):
         logger.info(f"User requested reset with: '{user_query}'")
-        clarification_msg = (
-            "Хорошо, начинаем новый поиск! Что ищем (город, даты, интересы, бюджет)?"
-        )
+        reset_message = "Хорошо, начинаем новый поиск! Расскажите, что бы вы хотели найти: город, даты и ваши интересы. 😊"
         return {
-            "collected_data": {},
+            "collected_data": {}, # Полный сброс собранных данных
             "current_events": [],
             "current_route_details": None,
-            "messages": messages + [AIMessage(content=clarification_msg)],
-            "status_message_to_user": clarification_msg,
-            "clarification_needed_fields": [],
-            "awaiting_clarification_for_field": None,
+            "messages": messages + [AIMessage(content=reset_message)],
+            "status_message_to_user": reset_message,
+            "clarification_needed_fields": [], # Очищаем список полей для уточнения
+            "clarification_context": None, # Очищаем контекст уточнения
+            "awaiting_clarification_for_field": None, # Сбрасываем ожидаемое поле
             "is_initial_plan_proposed": False,
             "is_full_plan_with_route_proposed": False,
-            "clarification_context": clarification_msg,
+            "awaiting_final_confirmation": False,
+            "pending_plan_modification_request": None,
+            "previous_confirmed_collected_data": None,
+            "previous_confirmed_events": None,
         }
 
+    # --- Обработка ответа на предыдущий уточняющий вопрос ---
     if awaiting_clarification_field:
-        logger.info(
-            f"Processing '{user_query}' as clarification for '{awaiting_clarification_field}'"
-        )
-        new_clarification_needed_fields = list(
-            current_collected_data_dict.get("clarification_needed_fields", [])
-        )
+        logger.info(f"Processing '{user_query}' as clarification for '{awaiting_clarification_field}'")
+        
+        # Получаем текущий список полей, требующих уточнения, из collected_data
+        # Это важно, так как new_clarification_needed_in_this_step - это для ТЕКУЩЕГО шага.
+        # А current_collected_data_dict["clarification_needed_fields"] - это то, что было ДО этого шага.
+        existing_clarification_fields = list(current_collected_data_dict.get("clarification_needed_fields", []))
 
         # Удаляем поле, по которому пришло уточнение, из списка необходимых уточнений
-        if awaiting_clarification_field in new_clarification_needed_fields:
-            new_clarification_needed_fields.remove(awaiting_clarification_field)
-
+        if awaiting_clarification_field in existing_clarification_fields:
+            existing_clarification_fields.remove(awaiting_clarification_field)
+        
+        # Применяем уточнение к current_collected_data_dict
         if awaiting_clarification_field == "city_name":
             current_collected_data_dict["city_name"] = user_query
-            cities = await fetch_cities_internal()
-            found_city = next(
-                (c for c in cities if user_query.lower() in c["name_lower"]), None
-            )
+            cities = await fetch_cities_internal() # Эта функция должна быть доступна
+            found_city = next((c for c in cities if user_query.lower() in c["name_lower"]), None)
             if found_city:
                 current_collected_data_dict["city_id_afisha"] = found_city["id"]
+                logger.info(f"Clarified city: '{user_query}' mapped to ID {found_city['id']}")
             else:
                 current_collected_data_dict["city_id_afisha"] = None
-                clarification_context_for_node = (
-                    f"Город '{user_query}' не найден. Попробуйте другой."
-                )
-                if "city_name" not in new_clarification_needed_fields:
-                    new_clarification_needed_fields.append("city_name")
+                clarification_context_for_node = f"Город '{user_query}' не найден. Пожалуйста, попробуйте указать другой город."
+                if "city_name" not in existing_clarification_fields: # Если его там не было, добавляем снова
+                    existing_clarification_fields.append("city_name")
 
         elif awaiting_clarification_field == "dates_description_original":
             current_collected_data_dict["dates_description_original"] = user_query
-            current_collected_data_dict["raw_time_description_original"] = None
-            parsed_dt_result = await datetime_parser_tool.ainvoke(
-                {
-                    "natural_language_date": user_query,
-                    "natural_language_time_qualifier": None,
-                    "base_date_iso": datetime.now().isoformat(),
-                }
-            )
+            current_collected_data_dict["raw_time_description_original"] = None # Сбрасываем, если уточняем всю дату
+            # Вызываем datetime_parser_tool
+            parsed_dt_result = await datetime_parser_tool.ainvoke({
+                "natural_language_date": user_query,
+                "natural_language_time_qualifier": None, # При уточнении даты, время не передаем отдельно
+                "base_date_iso": datetime.now().isoformat()
+            })
             if parsed_dt_result.get("datetime_iso"):
-                current_collected_data_dict["parsed_dates_iso"] = [
-                    parsed_dt_result["datetime_iso"]
-                ]
-                current_collected_data_dict["parsed_end_dates_iso"] = (
-                    [parsed_dt_result["end_datetime_iso"]]
-                    if parsed_dt_result.get("end_datetime_iso")
-                    else None
-                )
+                current_collected_data_dict["parsed_dates_iso"] = [parsed_dt_result["datetime_iso"]]
+                current_collected_data_dict["parsed_end_dates_iso"] = [parsed_dt_result["end_datetime_iso"]] if parsed_dt_result.get("end_datetime_iso") else None
+                logger.info(f"Clarified dates: '{user_query}' parsed to ISO {current_collected_data_dict['parsed_dates_iso']}")
                 if parsed_dt_result.get("is_ambiguous"):
-                    clarification_context_for_node = parsed_dt_result.get(
-                        "clarification_needed"
-                    )
-                    if (
-                        "dates_description_original"
-                        not in new_clarification_needed_fields
-                    ):
-                        new_clarification_needed_fields.append(
-                            "dates_description_original"
-                        )
+                    clarification_context_for_node = parsed_dt_result.get("clarification_needed")
+                    if "dates_description_original" not in existing_clarification_fields:
+                         existing_clarification_fields.append("dates_description_original")
             else:
-                clarification_context_for_node = (
-                    parsed_dt_result.get("clarification_needed")
-                    or "Не удалось распознать уточненную дату."
-                )
-                if "dates_description_original" not in new_clarification_needed_fields:
-                    new_clarification_needed_fields.append("dates_description_original")
-
+                clarification_context_for_node = parsed_dt_result.get("clarification_needed") or "Не удалось распознать уточненную дату. Попробуйте еще раз."
+                if "dates_description_original" not in existing_clarification_fields:
+                    existing_clarification_fields.append("dates_description_original")
+        
         elif awaiting_clarification_field == "interests_original":
-            interests_list = [i.strip() for i in user_query.split(",") if i.strip()]
-            current_collected_data_dict["interests_original"] = interests_list
-            mapped_interest_keys = []
-            for interest_str in interests_list:
-                s = interest_str.lower()
+            raw_interests_list_clarified = [i.strip() for i in user_query.split(",") if i.strip()]
+            current_collected_data_dict["interests_original"] = raw_interests_list_clarified
+            
+            mapped_interest_keys_clarified = []
+            user_requested_restaurant_explicitly_clarified = False
+            for interest_str in raw_interests_list_clarified:
+                s = interest_str.lower().strip()
                 key = None
-                if "фильм" in s or "кино" in s:
-                    key = "Movie"
-                elif "концерт" in s:
-                    key = "Concert"
-                elif "театр" in s or "спектакль" in s:
-                    key = "Performance"
-                elif "выставк" in s:
-                    key = "Exhibition"
-                elif "спорт" in s:
-                    key = "SportEvent"
-                elif "экскурс" in s:
-                    key = "Excursion"
-                elif "шоу" in s or "фестивал" in s or "ярмарк" in s:
-                    key = "Event"
-                elif "музей" in s:
-                    key = "Музей"
-                elif "прогулк" in s:
-                    key = "Прогулки"
-                elif "кафе" in s or "ресторан" in s or "покушать" in s or "поесть" in s:
-                    key = "Кафе"
-                if not key:
-                    key = interest_str.capitalize()
-                if key:
-                    mapped_interest_keys.append(key)
-            current_collected_data_dict["interests_keys_afisha"] = list(
-                set(mapped_interest_keys)
-            )
+                # <<< КОПИРУЕМ БЛОК МАППИНГА ИНТЕРЕСОВ ОТСЮДА >>>
+                if "кино" == s or "фильм" == s or "фильмы" == s or "кинотеатр" == s: key = "Movie"
+                elif "театр" == s or "спектакль" == s or "спектакли" == s or "пьес" in s: key = "Performance"
+                elif "опер" in s or "балет" == s: key = "OperaBallet"
+                elif "концерт" == s or "концерты" == s: key = "Concert"
+                elif "выставк" in s or "экспозици" in s: key = "Exhibition"
+                elif "фестивал" in s or "фест" == s: key = "Festival"
+                elif "стендап" in s or "stand-up" in s or "stand up" in s: key = "StandUp"
+                elif "спорт" == s or "матч" == s or "соревновани" in s: key = "SportEvent"
+                elif "вечерин" in s or "пати" == s or "party" == s or "тусовк" in s or "дискотек" in s: key = "Party"
+                elif "квиз" == s or "quiz" == s or "викторин" in s : key = "Quiz"
+                elif "мастер-класс" in s or "мастер класс" in s or "воркшоп" == s or "workshop" == s: key = "MasterClass"
+                elif "лекци" in s or "семинар" == s or "доклад" in s or ("конференци" in s and "пресс" not in s): key = "Lecture"
+                elif "экскурс" in s: key = "Excursion"
+                elif "музей" in s or "музеи" == s: key = "Museum"
+                elif "ресторан" in s or "кафе" == s or "бар" == s or "поесть" in s or "покушать" in s:
+                    user_requested_restaurant_explicitly_clarified = True
+                
+                if key: mapped_interest_keys_clarified.append(key)
+
+            current_collected_data_dict["interests_keys_afisha"] = list(set(mapped_interest_keys_clarified)) if mapped_interest_keys_clarified else None
+            logger.info(f"Clarified interests: '{user_query}' mapped to Afisha keys: {current_collected_data_dict['interests_keys_afisha']}")
+
+            if user_requested_restaurant_explicitly_clarified and not current_collected_data_dict["interests_keys_afisha"]:
+                clarification_context_for_node = "Похоже, вы снова указали только рестораны. Я не могу их искать как мероприятия. Пожалуйста, назовите другие типы активностей."
+                if "interests_original" not in existing_clarification_fields:
+                    existing_clarification_fields.append("interests_original")
+            elif not current_collected_data_dict["interests_keys_afisha"] and raw_interests_list_clarified: # Ввели что-то, но не смапилось
+                clarification_context_for_node = "Не смог распознать ваши уточненные интересы. Попробуйте еще раз (например, кино, театр)."
+                if "interests_original" not in existing_clarification_fields:
+                     existing_clarification_fields.append("interests_original")
 
         elif awaiting_clarification_field == "budget_original":
             try:
@@ -202,260 +200,211 @@ async def extract_initial_info_node(state: AgentState) -> Dict[str, Any]:
                     budget_val = int(budget_val_match.group(0))
                     current_collected_data_dict["budget_original"] = budget_val
                     current_collected_data_dict["budget_current_search"] = budget_val
+                    logger.info(f"Clarified budget: {budget_val}")
                 else:
                     raise ValueError("No digits in budget input")
             except ValueError:
                 clarification_context_for_node = "Пожалуйста, укажите бюджет числом."
-                if "budget_original" not in new_clarification_needed_fields:
-                    new_clarification_needed_fields.append("budget_original")
-
+                if "budget_original" not in existing_clarification_fields:
+                     existing_clarification_fields.append("budget_original")
+        
         elif awaiting_clarification_field == "user_start_address_original":
-            logger.info(f"Обработка уточнения адреса: '{user_query}'")
+            logger.info(f"Processing address clarification: '{user_query}'")
             city_for_geocoding = current_collected_data_dict.get("city_name")
-            previously_found_street = current_collected_data_dict.get(
-                "partial_address_street"
-            )
+            previously_found_street = current_collected_data_dict.get("partial_address_street")
             address_to_geocode = user_query
-            current_collected_data_dict["awaiting_address_input"] = (
-                False  # Сбрасываем флаг ожидания ввода адреса по умолчанию
-            )
+            
+            # Сбрасываем флаг ожидания ввода адреса (awaiting_address_input был в старой схеме, сейчас не используется явно в AgentState)
+            # Но если он был в current_collected_data_dict, его нужно убрать или поставить False
+            current_collected_data_dict.pop("awaiting_address_input", None) 
 
-            if previously_found_street and not any(
-                c.isalpha()
-                for c in user_query
-                if c.isalpha() and c.lower() not in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
-            ):
+            if previously_found_street and not any(c.isalpha() for c in user_query if c.isalpha() and c.lower() not in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"):
                 address_to_geocode = f"{previously_found_street}, {user_query}"
 
             if not city_for_geocoding:
-                clarification_context_for_node = "Сначала нужно указать город."
-                if "city_name" not in new_clarification_needed_fields:
-                    new_clarification_needed_fields.append("city_name")
-                if "partial_address_street" in current_collected_data_dict:
-                    del current_collected_data_dict["partial_address_street"]
+                clarification_context_for_node = "Для уточнения адреса мне сначала нужно знать город. Пожалуйста, укажите город."
+                if "city_name" not in existing_clarification_fields: existing_clarification_fields.append("city_name")
+                current_collected_data_dict.pop("partial_address_street", None) # Сброс частично найденной улицы
             else:
-                geocoding_result: GeocodingResult = await get_geocoding_details(
-                    address=address_to_geocode, city=city_for_geocoding
-                )
+                geocoding_result: GeocodingResult = await get_geocoding_details(address=address_to_geocode, city=city_for_geocoding)
                 if geocoding_result.is_precise_enough and geocoding_result.coords:
-                    current_collected_data_dict["user_start_address_original"] = (
-                        geocoding_result.full_address_name_gis
-                    )
-                    current_collected_data_dict[
-                        "user_start_address_validated_coords"
-                    ] = {
-                        "lon": geocoding_result.coords[0],
-                        "lat": geocoding_result.coords[1],
-                    }
-                    if "partial_address_street" in current_collected_data_dict:
-                        del current_collected_data_dict["partial_address_street"]
-                elif (
-                    geocoding_result.match_level == "street"
-                    and not previously_found_street
-                ):
-                    clarification_context_for_node = f"Нашел улицу '{geocoding_result.full_address_name_gis}'. Уточните номер дома."
-                    current_collected_data_dict["partial_address_street"] = (
-                        geocoding_result.full_address_name_gis
-                    )
-                    current_collected_data_dict["awaiting_address_input"] = True
-                    if (
-                        "user_start_address_original"
-                        not in new_clarification_needed_fields
-                    ):
-                        new_clarification_needed_fields.append(
-                            "user_start_address_original"
-                        )
-                else:
-                    if "partial_address_street" in current_collected_data_dict:
-                        del current_collected_data_dict["partial_address_street"]
-                    clarification_context_for_node = f"Не удалось распознать '{user_query}' как адрес. Уточните или скажите 'новый поиск'."
-                    current_collected_data_dict["awaiting_address_input"] = True
-                    if (
-                        "user_start_address_original"
-                        not in new_clarification_needed_fields
-                    ):
-                        new_clarification_needed_fields.append(
-                            "user_start_address_original"
-                        )
+                    current_collected_data_dict["user_start_address_original"] = geocoding_result.full_address_name_gis
+                    current_collected_data_dict["user_start_address_validated_coords"] = {"lon": geocoding_result.coords[0], "lat": geocoding_result.coords[1]}
+                    current_collected_data_dict.pop("partial_address_street", None)
+                    logger.info(f"Address '{address_to_geocode}' geocoded successfully to {geocoding_result.full_address_name_gis}")
+                elif geocoding_result.match_level == "street" and not previously_found_street : # Только если это первый раз улица найдена
+                    clarification_context_for_node = f"Нашел улицу '{geocoding_result.full_address_name_gis}'. Уточните, пожалуйста, номер дома."
+                    current_collected_data_dict["partial_address_street"] = geocoding_result.full_address_name_gis
+                    if "user_start_address_original" not in existing_clarification_fields:
+                         existing_clarification_fields.append("user_start_address_original")
+                else: # Неточный результат или повторный запрос после улицы
+                    clarification_context_for_node = f"Не удалось точно распознать адрес '{address_to_geocode}'. Попробуйте указать его еще раз, например: 'улица Ленина, 10'."
+                    current_collected_data_dict.pop("partial_address_street", None) # Сбрасываем, если не помогло
+                    if "user_start_address_original" not in existing_clarification_fields:
+                         existing_clarification_fields.append("user_start_address_original")
+        
+        # Обновляем список полей для уточнения в стейте
+        current_collected_data_dict["clarification_needed_fields"] = [f for f in existing_clarification_fields if f] # Удаляем None/пустые строки
+        current_collected_data_dict["awaiting_clarification_for_field"] = None # Сбрасываем поле, которое только что уточнили
 
-        current_collected_data_dict["clarification_needed_fields"] = [
-            f for f in new_clarification_needed_fields if f
-        ]
-        current_collected_data_dict["awaiting_clarification_for_field"] = None
-
+        logger.debug(f"After clarification. New collected_data: {str(current_collected_data_dict)[:300]}. Clarification context for next node: {clarification_context_for_node}")
         return {
             "collected_data": current_collected_data_dict,
-            "messages": messages,
-            "clarification_context": clarification_context_for_node,
-            "awaiting_clarification_for_field": None,
+            "messages": messages, # История сообщений не меняется этим узлом, только добавляется AIMessage следующим узлом
+            "clarification_context": clarification_context_for_node, # Передаем контекст (например, ошибку) дальше
+            "awaiting_clarification_for_field": None, # Мы обработали ожидаемое поле
         }
 
-    # --- Обработка НОВОГО запроса ---
-    logger.debug(
-        "extract_initial_info_node: Processing as a new/general query (awaiting_clarification_field is None)."
-    )
-    preserved_user_address = current_collected_data_dict.get(
-        "user_start_address_original"
-    )
-    preserved_user_coords = current_collected_data_dict.get(
-        "user_start_address_validated_coords"
-    )
-    # Для нового запроса, город и бюджет не сохраняем, они должны быть извлечены из нового запроса или запрошены
-
-    current_collected_data_dict_for_new_query = {}
-    if preserved_user_address:
-        current_collected_data_dict_for_new_query["user_start_address_original"] = (
-            preserved_user_address
-        )
-    if preserved_user_coords:
-        current_collected_data_dict_for_new_query[
-            "user_start_address_validated_coords"
-        ] = preserved_user_coords
+    # --- Обработка НОВОГО (не уточняющего) запроса ---
+    logger.debug("extract_initial_info_node: Processing as a new/general query (awaiting_clarification_field is None).")
+    
+    # Сохраняем только валидированный адрес пользователя между новыми запросами (если он есть)
+    # Город, даты, интересы, бюджет - должны извлекаться из нового запроса или запрашиваться заново.
+    preserved_user_address_original = current_collected_data_dict.get("user_start_address_original")
+    preserved_user_coords = current_collected_data_dict.get("user_start_address_validated_coords")
+    
+    current_collected_data_dict_for_new_query = {} # Начинаем с чистого листа для нового запроса
+    if preserved_user_address_original and preserved_user_coords: # Сохраняем только если адрес полностью валиден
+        current_collected_data_dict_for_new_query["user_start_address_original"] = preserved_user_address_original
+        current_collected_data_dict_for_new_query["user_start_address_validated_coords"] = preserved_user_coords
+        logger.debug(f"Preserving user address: {preserved_user_address_original}")
 
     llm = get_gigachat_client()
-    structured_llm = llm.with_structured_output(ExtractedInitialInfo)
+    structured_llm = llm.with_structured_output(ExtractedInitialInfo) # ExtractedInitialInfo - Pydantic модель
 
     try:
         extraction_prompt_with_query = f'{INITIAL_INFO_EXTRACTION_PROMPT}\n\nИзвлеки информацию из следующего запроса пользователя:\n"{user_query}"'
-        extracted_info: ExtractedInitialInfo = await structured_llm.ainvoke(
-            extraction_prompt_with_query
-        )
-        logger.info(
-            f"extract_initial_info_node: LLM Extracted Info (general): {extracted_info.model_dump_json(indent=2)}"
-        )
+        logger.debug(f"Sending to LLM for extraction: {user_query}")
+        extracted_info: ExtractedInitialInfo = await structured_llm.ainvoke(extraction_prompt_with_query)
+        logger.info(f"extract_initial_info_node: LLM Extracted Info (Pydantic): {extracted_info.model_dump_json(indent=2)}")
 
-        new_clarification_needed = []
-
+        # new_clarification_needed_in_this_step уже инициализирован как []
+        
+        # 1. Город
         if extracted_info.city:
             current_collected_data_dict_for_new_query["city_name"] = extracted_info.city
             cities = await fetch_cities_internal()
-            found_city = next(
-                (c for c in cities if extracted_info.city.lower() in c["name_lower"]),
-                None,
-            )
+            found_city = next((c for c in cities if extracted_info.city.lower() in c["name_lower"]), None)
             if found_city:
-                current_collected_data_dict_for_new_query["city_id_afisha"] = (
-                    found_city["id"]
-                )
+                current_collected_data_dict_for_new_query["city_id_afisha"] = found_city["id"]
             else:
-                new_clarification_needed.append("city_name")
+                new_clarification_needed_in_this_step.append("city_name")
+                clarification_context_for_node = (clarification_context_for_node or "") + f" Город '{extracted_info.city}' не найден. "
         else:
-            new_clarification_needed.append("city_name")
+            new_clarification_needed_in_this_step.append("city_name")
 
+        # 2. Интересы
+        user_requested_restaurant_explicitly_new = False
         if extracted_info.interests:
-            current_collected_data_dict_for_new_query["interests_original"] = (
-                extracted_info.interests
-            )
-            mapped_interest_keys = []
+            current_collected_data_dict_for_new_query["interests_original"] = extracted_info.interests
+            mapped_interest_keys_new = []
             for interest_str in extracted_info.interests:
-                s = interest_str.lower()
+                s = interest_str.lower().strip()
                 key = None
-                if "фильм" in s or "кино" in s:
-                    key = "Movie"
-                elif "концерт" in s:
-                    key = "Concert"
-                elif "театр" in s or "спектакль" in s:
-                    key = "Performance"
-                elif "выставк" in s:
-                    key = "Exhibition"
-                elif "спорт" in s:
-                    key = "SportEvent"
-                elif "экскурс" in s:
-                    key = "Excursion"
-                elif "шоу" in s or "фестивал" in s or "ярмарк" in s:
-                    key = "Event"
-                elif "музей" in s:
-                    key = "Музей"
-                elif "прогулк" in s:
-                    key = "Прогулки"
-                elif "кафе" in s or "ресторан" in s or "покушать" in s or "поесть" in s:
-                    key = "Кафе"
-                if not key:
-                    key = interest_str.capitalize()
-                if key:
-                    mapped_interest_keys.append(key)
-            current_collected_data_dict_for_new_query["interests_keys_afisha"] = list(
-                set(mapped_interest_keys)
-            )
-        else:
-            new_clarification_needed.append("interests_original")
+                # <<< КОПИРУЕМ БЛОК МАППИНГА ИНТЕРЕСОВ ОТСЮДА (такой же, как в блоке Clarification) >>>
+                if "кино" == s or "фильм" == s or "фильмы" == s or "кинотеатр" == s: key = "Movie"
+                elif "театр" == s or "спектакль" == s or "спектакли" == s or "пьес" in s: key = "Performance"
+                elif "опер" in s or "балет" == s: key = "OperaBallet"
+                elif "концерт" == s or "концерты" == s: key = "Concert"
+                elif "выставк" in s or "экспозици" in s: key = "Exhibition"
+                elif "фестивал" in s or "фест" == s: key = "Festival"
+                elif "стендап" in s or "stand-up" in s or "stand up" in s: key = "StandUp"
+                elif "спорт" == s or "матч" == s or "соревновани" in s: key = "SportEvent"
+                elif "вечерин" in s or "пати" == s or "party" == s or "тусовк" in s or "дискотек" in s: key = "Party"
+                elif "квиз" == s or "quiz" == s or "викторин" in s : key = "Quiz"
+                elif "мастер-класс" in s or "мастер класс" in s or "воркшоп" == s or "workshop" == s: key = "MasterClass"
+                elif "лекци" in s or "семинар" == s or "доклад" in s or ("конференци" in s and "пресс" not in s): key = "Lecture"
+                elif "экскурс" in s: key = "Excursion"
+                elif "музей" in s or "музеи" == s: key = "Museum"
+                elif "ресторан" in s or "кафе" == s or "бар" == s or "поесть" in s or "покушать" in s:
+                    user_requested_restaurant_explicitly_new = True
+                # <<< ДОСЮДА >>>
+                if key: mapped_interest_keys_new.append(key)
+            
+            current_collected_data_dict_for_new_query["interests_keys_afisha"] = list(set(mapped_interest_keys_new)) if mapped_interest_keys_new else None
+            
+            if user_requested_restaurant_explicitly_new and not current_collected_data_dict_for_new_query["interests_keys_afisha"]:
+                clarification_context_for_node = (clarification_context_for_node or "") + " Я не ищу рестораны как мероприятия. Могу поискать другие типы активностей. "
+                new_clarification_needed_in_this_step.append("interests_original")
+                # Очистим исходные интересы, если там были только рестораны
+                if current_collected_data_dict_for_new_query.get("interests_original"):
+                    current_collected_data_dict_for_new_query["interests_original"] = [
+                        i for i in current_collected_data_dict_for_new_query["interests_original"] 
+                        if not any(restr_kw in i.lower() for restr_kw in ["ресторан", "кафе", "бар", "поесть", "покушать"])
+                    ]
+                    if not current_collected_data_dict_for_new_query["interests_original"]:
+                        current_collected_data_dict_for_new_query["interests_original"] = None
+            elif not current_collected_data_dict_for_new_query["interests_keys_afisha"] and extracted_info.interests: # Извлекли, но не смапили
+                new_clarification_needed_in_this_step.append("interests_original")
+                clarification_context_for_node = (clarification_context_for_node or "") + " Не удалось точно определить ваши интересы. "
+        else: # LLM не извлек интересы
+            if not user_requested_restaurant_explicitly_new: # И это не был неявный запрос ресторана, который мы отфильтровали
+                new_clarification_needed_in_this_step.append("interests_original")
 
+        # 3. Бюджет
         if extracted_info.budget is not None:
-            current_collected_data_dict_for_new_query["budget_original"] = (
-                extracted_info.budget
-            )
-            current_collected_data_dict_for_new_query["budget_current_search"] = (
-                extracted_info.budget
-            )
+            current_collected_data_dict_for_new_query["budget_original"] = extracted_info.budget
+            current_collected_data_dict_for_new_query["budget_current_search"] = extracted_info.budget
+        # Запрос бюджета опционален, поэтому не добавляем в new_clarification_needed, если не указан.
+        # present_initial_plan_node может запросить его позже, если нужно.
 
-        date_desc = extracted_info.dates_description
-        time_desc = extracted_info.raw_time_description
-        current_collected_data_dict_for_new_query["dates_description_original"] = (
-            date_desc
-        )
-        current_collected_data_dict_for_new_query["raw_time_description_original"] = (
-            time_desc
-        )
+        # 4. Даты и Время
+        date_desc_llm = extracted_info.dates_description
+        time_desc_llm = extracted_info.raw_time_description
+        current_collected_data_dict_for_new_query["dates_description_original"] = date_desc_llm
+        current_collected_data_dict_for_new_query["raw_time_description_original"] = time_desc_llm
 
-        if date_desc or time_desc:
-            parsed_dt_res = await datetime_parser_tool.ainvoke(
-                {
-                    "natural_language_date": date_desc or "",
-                    "natural_language_time_qualifier": time_desc,
-                    "base_date_iso": datetime.now().isoformat(),
-                }
-            )
+        if date_desc_llm or time_desc_llm: # Если есть хотя бы описание даты или времени
+            # Вызываем datetime_parser_tool
+            parsed_dt_res = await datetime_parser_tool.ainvoke({
+                "natural_language_date": date_desc_llm or "", # Передаем пустую строку, если только время
+                "natural_language_time_qualifier": time_desc_llm,
+                "base_date_iso": datetime.now().isoformat()
+            })
             if parsed_dt_res.get("datetime_iso"):
-                current_collected_data_dict_for_new_query["parsed_dates_iso"] = [
-                    parsed_dt_res["datetime_iso"]
-                ]
-                current_collected_data_dict_for_new_query["parsed_end_dates_iso"] = (
-                    [parsed_dt_res["end_datetime_iso"]]
-                    if parsed_dt_res.get("end_datetime_iso")
-                    else None
-                )
+                current_collected_data_dict_for_new_query["parsed_dates_iso"] = [parsed_dt_res["datetime_iso"]]
+                current_collected_data_dict_for_new_query["parsed_end_dates_iso"] = [parsed_dt_res["end_datetime_iso"]] if parsed_dt_res.get("end_datetime_iso") else None
                 if parsed_dt_res.get("is_ambiguous"):
-                    new_clarification_needed.append("dates_description_original")
-                    clarification_context_for_node = parsed_dt_res.get(
-                        "clarification_needed"
-                    )
-            else:
-                new_clarification_needed.append("dates_description_original")
-                clarification_context_for_node = (
-                    parsed_dt_res.get("clarification_needed")
-                    or "Не удалось распознать дату/время."
-                )
-        else:
-            new_clarification_needed.append("dates_description_original")
+                    new_clarification_needed_in_this_step.append("dates_description_original")
+                    clarification_context_for_node = (clarification_context_for_node or "") + (parsed_dt_res.get("clarification_needed") or "") + " "
+            else: # Если парсер не вернул datetime_iso
+                new_clarification_needed_in_this_step.append("dates_description_original")
+                clarification_context_for_node = (clarification_context_for_node or "") + (parsed_dt_res.get("clarification_needed") or "Не удалось распознать дату/время. ") + " "
+        else: # Если LLM не извлек ни дату, ни время
+            new_clarification_needed_in_this_step.append("dates_description_original")
+        
+        # Финальное формирование списка полей для уточнения и общего контекста
+        current_collected_data_dict_for_new_query["clarification_needed_fields"] = list(set(new_clarification_needed_in_this_step))
+        
+        # Заменяем текущие собранные данные на данные нового запроса
+        current_collected_data_dict = current_collected_data_dict_for_new_query 
 
-        current_collected_data_dict_for_new_query["clarification_needed_fields"] = list(
-            set(new_clarification_needed)
-        )
-        current_collected_data_dict = current_collected_data_dict_for_new_query  # Заменяем на данные нового запроса
-
-    except Exception as e:
-        logger.error(
-            f"extract_initial_info_node: LLM extraction error: {e}", exc_info=True
-        )
-        current_collected_data_dict.setdefault("clarification_needed_fields", [])
+    except ValidationError as ve_llm: # Ошибка валидации ответа LLM по Pydantic схеме
+        logger.error(f"extract_initial_info_node: LLM Pydantic validation error: {ve_llm}", exc_info=True)
+        # Запрашиваем все основные поля, так как не смогли извлечь
+        current_collected_data_dict["clarification_needed_fields"] = list(set(["city_name", "dates_description_original", "interests_original"]))
+        clarification_context_for_node = "Произошла ошибка при обработке вашего запроса. Давайте попробуем собрать информацию по частям."
+    except Exception as e_llm: # Любая другая ошибка при вызове LLM
+        logger.error(f"extract_initial_info_node: LLM extraction error: {e_llm}", exc_info=True)
+        current_collected_data_dict.setdefault("clarification_needed_fields", []) # Гарантируем, что список есть
         for f_key in ["city_name", "dates_description_original", "interests_original"]:
-            if f_key not in current_collected_data_dict.get(
-                "clarification_needed_fields", []
-            ) and not current_collected_data_dict.get(f_key):
+            # Добавляем поле для уточнения, если оно еще не заполнено и не в списке
+            if not current_collected_data_dict.get(f_key) and f_key not in current_collected_data_dict["clarification_needed_fields"]:
                 current_collected_data_dict["clarification_needed_fields"].append(f_key)
-        current_collected_data_dict["clarification_needed_fields"] = list(
-            set(current_collected_data_dict["clarification_needed_fields"])
-        )
-        clarification_context_for_node = "Ошибка обработки запроса. Попробуйте еще раз."
+        current_collected_data_dict["clarification_needed_fields"] = list(set(current_collected_data_dict["clarification_needed_fields"]))
+        clarification_context_for_node = "Ошибка обработки вашего запроса. Попробуйте, пожалуйста, еще раз или переформулируйте."
 
-    logger.info(
-        f"extract_initial_info_node: Final collected_data (general): {str(current_collected_data_dict)[:500]}"
-    )
+    logger.info(f"extract_initial_info_node: Final collected_data for this step: {str(current_collected_data_dict)[:500]}. Clarification context: {clarification_context_for_node}")
+    
+    # Убедимся, что clarification_context_for_node не пустая строка, а None если нет контекста
+    if clarification_context_for_node is not None and not clarification_context_for_node.strip():
+        clarification_context_for_node = None
+
     return {
         "collected_data": current_collected_data_dict,
         "messages": messages,
         "clarification_context": clarification_context_for_node,
-        "awaiting_clarification_for_field": None,
+        "awaiting_clarification_for_field": None, # Для нового запроса мы не ждем уточнения конкретного поля
     }
 
 
@@ -598,16 +547,189 @@ async def clarify_missing_data_node(state: AgentState) -> Dict[str, Any]:
     }
 
 
-# --- Узел 3: Поиск мероприятий (ОБНОВЛЕННАЯ ВЕРСИЯ) ---
+
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ SEARCH_EVENTS_NODE ---
+
+async def _fetch_events_via_tool_for_interest(
+    internal_key: str,
+    city_id: int,
+    api_date_from_dt: datetime, 
+    api_date_to_dt: datetime,   
+    min_start_event_time_filter: Optional[datetime], 
+    max_start_event_time_filter: Optional[datetime], 
+    budget: Optional[int],
+    user_max_overall_end_dt_naive_plan: Optional[datetime] 
+) -> List[Event]:
+    logger.debug(
+        f"_fetch_events_via_tool: key='{internal_key}', city={city_id}, "
+        f"API_dates=[{api_date_from_dt.date()} to {api_date_to_dt.date()-timedelta(days=1)}], "
+        f"min_event_start={min_start_event_time_filter}, max_event_start={max_start_event_time_filter}, "
+        f"user_max_plan_end={user_max_overall_end_dt_naive_plan}"
+    )
+    try:
+        event_dicts_from_tool: List[Dict] = await event_search_tool.ainvoke({
+            "city_id": city_id,
+            "date_from": api_date_from_dt, # Этот параметр ожидает event_search_tool
+            "date_to": api_date_to_dt,     # Этот параметр ожидает event_search_tool
+            "interests_keys": [internal_key], 
+            "min_start_time_naive": min_start_event_time_filter,
+            "max_start_time_naive": max_start_event_time_filter,
+            "max_budget_per_person": budget,
+            "exclude_session_ids": None,
+        })
+        
+        valid_events: List[Event] = []
+        if not isinstance(event_dicts_from_tool, list):
+            logger.error(f"event_search_tool for key '{internal_key}' returned non-list: {type(event_dicts_from_tool)}")
+            return []
+
+        for evt_dict in event_dicts_from_tool:
+            if not isinstance(evt_dict, dict):
+                logger.warning(f"Skipping non-dict item from event_search_tool for key '{internal_key}': {type(evt_dict)}")
+                continue
+            try:
+                event_obj = Event(**evt_dict) 
+                
+                if user_max_overall_end_dt_naive_plan:
+                    # Приблизительное время окончания события
+                    event_duration_minutes = event_obj.duration_minutes or 120 # Дефолтная длительность, если неизвестна
+                    event_end_time_approx = event_obj.start_time_naive_event_tz + timedelta(minutes=event_duration_minutes)
+                    if event_end_time_approx > user_max_overall_end_dt_naive_plan:
+                        logger.debug(f"Filtering out event '{event_obj.name}' (key: {internal_key}) as it ends ({event_end_time_approx}) after user_max_overall_plan_end_time ({user_max_overall_end_dt_naive_plan})")
+                        continue
+                
+                valid_events.append(event_obj)
+            except ValidationError as ve:
+                logger.warning(f"Validation error for event data from tool for key '{internal_key}': {str(evt_dict)[:300]}. Error: {ve}")
+        
+        valid_events.sort(key=lambda e: e.start_time_naive_event_tz) # Сортируем сразу
+        logger.info(f"Fetched and validated {len(valid_events)} events for internal_key='{internal_key}'")
+        return valid_events
+    except Exception as e_tool_invoke:
+        logger.error(f"Error invoking event_search_tool for internal_key='{internal_key}': {e_tool_invoke}", exc_info=True)
+        return []
+
+# --- Вспомогательные функции для фильтрации событий ---
+
+def _is_event_standup(event: Event) -> bool:
+    """Проверяет, является ли событие стендапом на основе его данных."""
+    if not event:
+        return False
+
+    # 1. Проверка типа API, с которым мы его искали (ожидаем Concert)
+    # actual_api_type берется из поля 'Type' самого Creation из API
+    if event.actual_api_type != "Concert":
+        logger.debug(f"Event '{event.name}' (actual_api_type: {event.actual_api_type}) is not 'Concert', skipping StandUp check.")
+        return False
+
+    name_lower = event.name.lower()
+    description_lower = ((event.description or "") + " " + (event.short_description or "")).lower()
+    genres_lower = [g.lower() for g in (event.genres or [])]
+
+    standup_keywords_name = ["стендап", "stand-up", "stand up", "открытый микрофон", "проверка материала", "комик", "сольный концерт"] # Добавил "сольный концерт"
+    standup_keywords_description = ["стендап", "stand-up", "комик", "юмористическое шоу", "вечер комедии", "шутки", "монологи"]
+    standup_genre_keywords = ["humor", "юмор"] # "comedy" может быть у комедийных спектаклей
+
+    # Ключевые слова, указывающие, что это НЕ стендап (даже если тип "Concert")
+    negative_keywords = [
+        "поэзии", "литературный", "маяковский", "есенин", "стихи", "музыкальный",
+        "группы", "песни", "спектакль", "пьеса", "театр", "драма", "опера", "балет"
+    ]
+
+    if any(neg_kw in name_lower or neg_kw in description_lower for neg_kw in negative_keywords):
+        logger.debug(f"Event '{event.name}' filtered out as non-standup (negative keywords).")
+        return False
+
+    name_match = any(kw in name_lower for kw in standup_keywords_name)
+    desc_match = any(kw in description_lower for kw in standup_keywords_description)
+    genre_match = any(gkw in genres_lower for gkw in standup_genre_keywords)
+    
+    place_name_match = False
+    if event.place_name and ("стендап-клуб" in event.place_name.lower() or "comedy club" in event.place_name.lower()):
+        place_name_match = True
+
+    # Считаем стендапом, если есть прямое указание в названии,
+    # или подходящее описание/жанр/место и нет явных негативных признаков.
+    if name_match: # Если в названии есть "стендап" и т.п. - это самый сильный признак
+        return True
+    if place_name_match and (desc_match or genre_match): # Если в стендап-клубе и есть признаки юмора/комедии
+        return True
+    if genre_match and desc_match: # Если жанр юмор и описание подходящее
+        return True
+    
+    # Если только описание или только жанр (без явного названия или места) - можем быть более осторожны
+    # Например, если просто genre_match, это может быть комедийный концерт, но не стендап.
+    # Если только desc_match, тоже стоит проверить внимательнее.
+    # Пока оставим так: если есть хоть один из desc_match, genre_match, place_name_match (и прошло негативные фильтры)
+    if desc_match or genre_match:
+         # Можно добавить лог, чтобы посмотреть на такие случаи
+        logger.debug(f"Event '{event.name}' considered StandUp based on description/genre (desc: {desc_match}, genre: {genre_match}, place: {place_name_match})")
+        return True
+
+    return False
+
+
+def _is_event_museum(event: Event) -> bool:
+    """Проверяет, является ли событие музеем на основе его данных."""
+    if not event:
+        return False
+
+    # actual_api_type - тип самого "Creation" из API Афиши
+    # event.place.Type - тип места из данных /schedule (если есть)
+    # Для музеев мы можем ожидать actual_api_type 'Admission' или 'Event' (если ищем по 'Event')
+    
+    if event.actual_api_type not in ["Admission", "Event"]:
+        logger.debug(f"Event '{event.name}' (actual_api_type: {event.actual_api_type}) is not 'Admission' or 'Event', skipping Museum check.")
+        return False
+
+    name_lower = event.name.lower()
+    place_name_lower = (event.place_name or "").lower()
+    description_lower = ((event.description or "") + " " + (event.short_description or "")).lower()
+    
+    # Основные ключевые слова
+    museum_keywords = [
+        "музей", "экспона", "коллекци", "галере", "усадьб", "дом-музей", 
+        "историческ", "художествен", "краеведческ", "выставк", "экспозици", # Выставки часто в музеях
+        "панорама", "диорама", "археологическ", "мемориальн"
+    ]
+    # Типы мест, которые могут быть музеями
+    place_type_keywords = ["музей", "галерея", "океанариум", "планетарий", "выставочный зал", "павильон"]
+
+
+    # 1. Прямое указание в названии события или места
+    if any(kw in name_lower for kw in museum_keywords) or \
+       any(kw in place_name_lower for kw in museum_keywords) or \
+       any(ptkw in place_name_lower for ptkw in place_type_keywords):
+        logger.debug(f"Event '{event.name}' (Place: '{event.place_name}') considered a Museum (keyword in name/place_name).")
+        return True
+
+    # 2. Проверка описания
+    if any(kw in description_lower for kw in museum_keywords):
+        logger.debug(f"Event '{event.name}' considered a Museum (keyword in description).")
+        return True
+        
+    # 3. Если тип места из API явно "Museum" (поле Place.Type из /schedule)
+    #    Это поле не стандартизировано в вашей схеме Event, но если бы было, можно было бы использовать.
+    #    Пока что ваш `event.actual_api_type` - это тип *события*, а не *места*.
+    #    В логах мы видели, что "Воронежский океанариум" приходил с `Place.Type: 'Museum'`
+    #    Если вы добавите `place_api_type: Optional[str]` в схему `Event` и будете его заполнять
+    #    из `schedule_block.get("Place", {}).get("Type")` в `afisha_service.py`, то можно будет проверить:
+    #    if event.place_api_type and event.place_api_type.lower() == "museum":
+    #        logger.debug(f"Event '{event.name}' at place with API type 'Museum' considered a Museum.")
+    #        return True
+
+    logger.debug(f"Event '{event.name}' (Place: '{event.place_name}') did not pass Museum filters.")
+    return False
+
+# --- Узел 3: Поиск мероприятий (ОБНОВЛЕННАЯ ВЕРСИЯ с улучшенной фильтрацией) ---
 async def search_events_node(state: AgentState) -> Dict[str, Any]:
     logger.info("Node: search_events_node executing...")
     collected_data_dict: dict = dict(state.get("collected_data", {}))
-    original_user_interests_keys: List[str] = list(
-        collected_data_dict.get("interests_keys_afisha", [])
-    )
+    original_user_interests_keys: List[str] = list(collected_data_dict.get("interests_keys_afisha", []))
 
+    # Сброс полей перед каждым новым поиском
     collected_data_dict["not_found_interest_keys_in_primary_search"] = []
-    collected_data_dict["fallback_candidates"] = {}
+    collected_data_dict["fallback_candidates"] = {} # Словарь для {interest_key: Event_Pydantic_object}
     collected_data_dict["fallback_accepted_and_plan_updated"] = False
 
     city_id = collected_data_dict.get("city_id_afisha")
@@ -615,181 +737,253 @@ async def search_events_node(state: AgentState) -> Dict[str, Any]:
     budget = collected_data_dict.get("budget_current_search")
 
     if not city_id or not parsed_dates_iso_list or not original_user_interests_keys:
-        logger.warning(f"search_events_node: Missing critical data for search.")
-        collected_data_dict["not_found_interest_keys_in_primary_search"] = list(
-            original_user_interests_keys
-        )
-        return {
-            "current_events": [],
-            "is_initial_plan_proposed": False,
-            "collected_data": collected_data_dict,
-        }
+        logger.warning(f"search_events_node: Missing critical data. City: {city_id}, Dates: {parsed_dates_iso_list}, Interests: {original_user_interests_keys}")
+        # Заполняем not_found_interest_keys_in_primary_search исходными интересами, если они были
+        collected_data_dict["not_found_interest_keys_in_primary_search"] = list(original_user_interests_keys) if original_user_interests_keys else list(collected_data_dict.get("interests_original",[]))
+        return {"current_events": [], "is_initial_plan_proposed": False, "collected_data": collected_data_dict}
 
     try:
         user_min_start_dt_naive = datetime.fromisoformat(parsed_dates_iso_list[0])
-        user_explicitly_provided_time = not (
-            user_min_start_dt_naive.hour == 0 and user_min_start_dt_naive.minute == 0
-        )
-        api_date_from_dt = user_min_start_dt_naive.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        api_date_to_for_primary_search = api_date_from_dt + timedelta(days=1)
-        parsed_end_dates_iso_list = collected_data_dict.get("parsed_end_dates_iso")
+        api_date_from_dt = user_min_start_dt_naive.replace(hour=0, minute=0, second=0, microsecond=0)
+        
         user_max_overall_end_dt_naive: Optional[datetime] = None
+        parsed_end_dates_iso_list = collected_data_dict.get("parsed_end_dates_iso")
         if parsed_end_dates_iso_list and parsed_end_dates_iso_list[0]:
             temp_end_dt = datetime.fromisoformat(parsed_end_dates_iso_list[0])
-            if (
-                temp_end_dt.hour == 0
-                and temp_end_dt.minute == 0
-                and temp_end_dt.second == 0
-            ):
-                user_max_overall_end_dt_naive = temp_end_dt.replace(
-                    hour=23, minute=59, second=59
-                )
-            else:
-                user_max_overall_end_dt_naive = temp_end_dt
-            if user_max_overall_end_dt_naive.date() >= api_date_from_dt.date():
-                api_date_to_for_primary_search = user_max_overall_end_dt_naive.replace(
-                    hour=0, minute=0, second=0, microsecond=0
-                ) + timedelta(days=1)
-    except Exception as e:
-        logger.error(f"Error parsing dates in search_events_node: {e}", exc_info=True)
-        return {
-            "current_events": [],
-            "is_initial_plan_proposed": False,
-            "collected_data": collected_data_dict,
-        }
+            # Если время не указано (00:00), то считаем до конца дня
+            user_max_overall_end_dt_naive = temp_end_dt.replace(hour=23, minute=59, second=59) if temp_end_dt.hour == 0 and temp_end_dt.minute == 0 else temp_end_dt
+        
+        # Дата окончания для API Афиши (всегда +1 день от последней интересующей даты, время 00:00)
+        api_date_to_for_primary_search_dt = (user_max_overall_end_dt_naive or api_date_from_dt).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    except Exception as e_date_parse:
+        logger.error(f"Error parsing dates in search_events_node: {e_date_parse}", exc_info=True)
+        collected_data_dict["not_found_interest_keys_in_primary_search"] = list(original_user_interests_keys)
+        return {"current_events": [], "is_initial_plan_proposed": False, "collected_data": collected_data_dict}
 
-    all_events_found_by_type_primary: Dict[str, List[Event]] = {}
-    min_start_for_primary = (
-        user_min_start_dt_naive
-        if user_explicitly_provided_time
-        else api_date_from_dt.replace(hour=17, minute=0)
-    )
-    max_start_for_primary = user_max_overall_end_dt_naive  # Это максимальное время НАЧАЛА для event_search_tool
+    min_start_for_primary_search: Optional[datetime] = None
+    # Если в user_min_start_dt_naive время не 00:00, значит пользователь указал конкретное время начала
+    if not (user_min_start_dt_naive.hour == 0 and user_min_start_dt_naive.minute == 0):
+        min_start_for_primary_search = user_min_start_dt_naive
+    
+    # max_start_for_primary_search - максимальное ВРЕМЯ НАЧАЛА события в рамках интересующего дня/диапазона
+    # Если user_max_overall_end_dt_naive не None, то это и есть ограничение.
+    # Иначе, если ищем на один день без указания времени окончания, то ограничения по max_start_time нет.
+    max_start_for_primary_search = user_max_overall_end_dt_naive 
 
-    async def _perform_search_internal(
-        interest_key: str,
-        min_start: Optional[datetime],
-        max_start: Optional[datetime],
-        date_from_search: datetime,
-        date_to_search: datetime,
-    ) -> List[Event]:
-        # ... (эта функция остается без изменений из предыдущего ответа)
-        tool_args = EventSearchToolArgs(
-            city_id=city_id,
-            date_from=date_from_search,
-            date_to=date_to_search,
-            interests_keys=[interest_key],
-            min_start_time_naive=min_start,
-            max_start_time_naive=max_start,
-            max_budget_per_person=budget,
-        )
-        logger.info(
-            f"Searching for '{interest_key}'. Min start: {min_start}, Max start: {max_start}. Date range: {date_from_search.date()} - {date_to_search.date() - timedelta(days=1)}"
-        )
-        try:
-            events_dicts: List[Dict] = await event_search_tool.ainvoke(
-                tool_args.model_dump(exclude_none=True)
-            )
-            valid_events = []
-            for evt_data in events_dicts:
-                try:
-                    event = Event(**evt_data)
-                    if (
-                        user_max_overall_end_dt_naive
-                    ):  # Фильтруем по времени ОКОНЧАНИЯ здесь
-                        event_end_time = event.start_time_naive_event_tz + timedelta(
-                            minutes=event.duration_minutes or 120
-                        )
-                        if event_end_time > user_max_overall_end_dt_naive:
-                            continue
-                    valid_events.append(event)
-                except ValidationError as ve:
-                    logger.warning(
-                        f"Invalid event data for '{interest_key}': {evt_data.get('name', 'N/A')}, error: {ve}"
-                    )
-            return valid_events
-        except Exception as e_tool_search:
-            logger.error(
-                f"Error in event_search_tool for '{interest_key}': {e_tool_search}",
-                exc_info=True,
-            )
-            return []
-
-    primary_tasks = [
-        _perform_search_internal(
-            interest,
-            min_start_for_primary,
-            max_start_for_primary,
-            api_date_from_dt,
-            api_date_to_for_primary_search,
-        )
-        for interest in original_user_interests_keys
-    ]
-    results_primary_list: List[List[Event]] = await asyncio.gather(*primary_tasks, return_exceptions=True)  # type: ignore
-
-    for i, interest_key in enumerate(original_user_interests_keys):
-        result_item = results_primary_list[i]
-        if isinstance(result_item, Exception):
-            continue
-        if result_item:
-            all_events_found_by_type_primary[interest_key] = sorted(
-                result_item, key=lambda e: e.start_time_naive_event_tz
-            )
-        else:
-            collected_data_dict.setdefault(
-                "not_found_interest_keys_in_primary_search", []
-            ).append(interest_key)
-
-    interests_for_fallback = collected_data_dict.get(
-        "not_found_interest_keys_in_primary_search", []
-    )
-    if interests_for_fallback:
-        fallback_date_from = api_date_from_dt
-        fallback_date_to = api_date_from_dt + timedelta(days=7)
-        fallback_tasks = [
-            _perform_search_internal(
-                interest, None, None, fallback_date_from, fallback_date_to
-            )
-            for interest in interests_for_fallback
-        ]  # Ищем на весь день
-        results_fallback_list: List[List[Event]] = await asyncio.gather(*fallback_tasks, return_exceptions=True)  # type: ignore
-        for i, interest_key_fb in enumerate(interests_for_fallback):
-            result_item_fb = results_fallback_list[i]
-            if isinstance(result_item_fb, Exception):
-                continue
-            if result_item_fb:
-                sorted_fb_events = sorted(
-                    result_item_fb, key=lambda e: e.start_time_naive_event_tz
-                )
-                collected_data_dict.setdefault("fallback_candidates", {})[
-                    interest_key_fb
-                ] = sorted_fb_events[0].model_dump()
-
-    # --- НОВАЯ ЛОГИКА ФОРМИРОВАНИЯ events_to_propose ---
-    events_to_propose: List[Event] = []
+    # --- Шаг 1: Первичный поиск по каждому интересу пользователя ---
+    all_events_found_by_type_primary: Dict[str, List[Event]] = {} # {interest_key: [Event, ...]}
+    
+    primary_search_tasks = []
     for interest_key in original_user_interests_keys:
-        if (
-            interest_key in all_events_found_by_type_primary
-            and all_events_found_by_type_primary[interest_key]
-        ):
-            # Берем первое (самое раннее) подходящее событие для этого интереса
-            events_to_propose.append(all_events_found_by_type_primary[interest_key][0])
+        task = _fetch_events_via_tool_for_interest( # Эта функция уже возвращает List[Event]
+            internal_key=interest_key,
+            city_id=city_id,
+            api_date_from_dt=api_date_from_dt,
+            api_date_to_dt=api_date_to_for_primary_search_dt,
+            min_start_event_time_filter=min_start_for_primary_search,
+            max_start_event_time_filter=max_start_for_primary_search,
+            budget=budget,
+            user_max_overall_end_dt_naive_plan=user_max_overall_end_dt_naive # Для фильтрации по времени ОКОНЧАНИЯ события
+        )
+        primary_search_tasks.append(task)
+    
+    results_of_primary_searches: List[List[Event]] = await asyncio.gather(*primary_search_tasks, return_exceptions=True)
 
-    # Сортируем итоговый список предложений по времени начала
+    for i, internal_key in enumerate(original_user_interests_keys):
+        result_list_or_exc = results_of_primary_searches[i]
+        if isinstance(result_list_or_exc, Exception):
+            logger.error(f"Exception during primary search for interest_key='{internal_key}': {result_list_or_exc}")
+            all_events_found_by_type_primary[internal_key] = []
+        elif result_list_or_exc: # result_list_or_exc это List[Event]
+            all_events_found_by_type_primary[internal_key] = result_list_or_exc # Уже отсортированы в _fetch_...
+        else:
+            all_events_found_by_type_primary[internal_key] = []
+
+    # --- Шаг 2: Дополнительная фильтрация и выбор лучших кандидатов ---
+    events_to_propose: List[Event] = []
+    proposed_session_ids: Set[int] = set() # Чтобы не предлагать одно и то же событие (сеанс) дважды
+
+    for internal_interest_key in original_user_interests_keys:
+        candidate_events_for_key: List[Event] = all_events_found_by_type_primary.get(internal_interest_key, [])
+        
+        if not candidate_events_for_key:
+            logger.info(f"No API results for internal_interest_key='{internal_interest_key}' to perform post-filtering.")
+            if internal_interest_key not in collected_data_dict["not_found_interest_keys_in_primary_search"]:
+                 collected_data_dict["not_found_interest_keys_in_primary_search"].append(internal_interest_key)
+            continue
+
+        logger.debug(f"Post-filtering for internal_interest_key='{internal_interest_key}' with {len(candidate_events_for_key)} candidates.")
+        best_event_for_this_key: Optional[Event] = None
+
+        if internal_interest_key == "Museum":
+            for event_candidate in candidate_events_for_key:
+                if event_candidate.session_id in proposed_session_ids: continue
+                if _is_event_museum(event_candidate):
+                    best_event_for_this_key = event_candidate
+                    break
+        
+        elif internal_interest_key == "StandUp":
+            for event_candidate in candidate_events_for_key:
+                if event_candidate.session_id in proposed_session_ids: continue
+                if _is_event_standup(event_candidate):
+                    best_event_for_this_key = event_candidate
+                    break
+        
+        # Добавьте elif для других "сложных" категорий (Exhibition, Festival, etc.)
+        # используя аналогичные функции-фильтры _is_event_exhibition, _is_event_festival
+
+        else: # Для "простых" категорий, где тип API обычно достаточно надежен (Movie, Concert (не стендап!), Performance (театр))
+            # Можно добавить более строгую проверку event.actual_api_type, если необходимо
+            # Например, для "Concert" (если это не стендап) можно проверить, что это не "Humor" жанр
+            # или не содержит ключевых слов стендапа, если "StandUp" тоже мапится на "Concert".
+            # Сейчас для простоты берем первого подходящего.
+            
+            expected_api_type: Optional[str] = None
+            # Пример: если "Concert" используется и для обычных концертов, и для стендапов,
+            # то здесь мы бы хотели отобрать "Concert", который НЕ стендап.
+            if internal_interest_key == "Concert": # Это должен быть "обычный" концерт
+                expected_api_type = "Concert"
+                for event_candidate in candidate_events_for_key:
+                    if event_candidate.session_id in proposed_session_ids: continue
+                    if event_candidate.actual_api_type == expected_api_type and not _is_event_standup(event_candidate): # Убедимся, что это не стендап
+                        best_event_for_this_key = event_candidate
+                        break
+            elif internal_interest_key == "Performance": # Ожидаем театр/оперу/балет
+                 expected_api_type = "Performance"
+                 for event_candidate in candidate_events_for_key:
+                    if event_candidate.session_id in proposed_session_ids: continue
+                    # Здесь тоже можно добавить исключающую логику, если "Performance" используется для стендапов
+                    if event_candidate.actual_api_type == expected_api_type and not _is_event_standup(event_candidate):
+                        best_event_for_this_key = event_candidate
+                        break
+            # Добавьте другие "простые" ключи
+            # ...
+
+            if not best_event_for_this_key and candidate_events_for_key: # Если не нашли по строгим правилам, берем первого доступного
+                for event_candidate in candidate_events_for_key:
+                    if event_candidate.session_id not in proposed_session_ids:
+                        # Для "простых" типов можно также проверить, что actual_api_type соответствует ожидаемому
+                        # Например, для "Movie" -> event_candidate.actual_api_type == "Movie"
+                        # Но это уже должно было быть отфильтровано в afisha_service по CreationType
+                        best_event_for_this_key = event_candidate
+                        logger.info(f"Taking first available for simple key '{internal_interest_key}': {best_event_for_this_key.name}")
+                        break
+        
+        if best_event_for_this_key:
+            logger.info(f"Selected event '{best_event_for_this_key.name}' (ID: {best_event_for_this_key.session_id}, Actual API type: {best_event_for_this_key.actual_api_type}) for internal_interest_key='{internal_interest_key}'.")
+            events_to_propose.append(best_event_for_this_key)
+            proposed_session_ids.add(best_event_for_this_key.session_id)
+        else:
+            logger.info(f"No suitable event found for internal_interest_key='{internal_interest_key}' after primary search post-filtering.")
+            if internal_interest_key not in collected_data_dict["not_found_interest_keys_in_primary_search"]:
+                collected_data_dict["not_found_interest_keys_in_primary_search"].append(internal_interest_key)
+
     events_to_propose.sort(key=lambda e: e.start_time_naive_event_tz)
-    # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
+
+    # --- Шаг 3: Логика Fallback для ненайденных интересов ---
+    interests_for_fallback_search = collected_data_dict.get("not_found_interest_keys_in_primary_search", [])
+    
+    if interests_for_fallback_search:
+        logger.info(f"Attempting fallback search for interests: {interests_for_fallback_search}")
+        # Для fallback ищем на более широкий диапазон дат и без строгих временных ограничений пользователя
+        fallback_api_date_from_dt = api_date_from_dt # Начинаем с той же даты, что и основной поиск
+        fallback_api_date_to_dt = fallback_api_date_from_dt + timedelta(days=7) # На неделю вперед
+        
+        fallback_search_tasks = []
+        for interest_fb_key in interests_for_fallback_search:
+            task_fb = _fetch_events_via_tool_for_interest(
+                internal_key=interest_fb_key,
+                city_id=city_id,
+                api_date_from_dt=fallback_api_date_from_dt,
+                api_date_to_dt=fallback_api_date_to_dt, 
+                min_start_event_time_filter=None, # Без ограничений по времени начала
+                max_start_event_time_filter=None, # Без ограничений по времени начала
+                budget=budget, # Бюджет сохраняем
+                user_max_overall_end_dt_naive_plan=None # Без ограничений по времени окончания плана
+            )
+            fallback_search_tasks.append(task_fb)
+            
+        results_of_fallback_searches: List[List[Event]] = await asyncio.gather(*fallback_search_tasks, return_exceptions=True)
+
+        current_fallback_candidates: Dict[str, Event] = {} # Собираем здесь перед записью в state
+
+        for i, internal_key_fb in enumerate(interests_for_fallback_search):
+            fb_event_list_or_exc = results_of_fallback_searches[i]
+            
+            if isinstance(fb_event_list_or_exc, Exception) or not fb_event_list_or_exc:
+                logger.warning(f"Fallback search for '{internal_key_fb}' yielded no results or an error: {fb_event_list_or_exc if isinstance(fb_event_list_or_exc, Exception) else 'No results'}")
+                continue
+            
+            # Применяем ту же пост-фильтрацию к результатам fallback
+            best_fallback_candidate_for_key_obj: Optional[Event] = None
+            
+            if internal_key_fb == "Museum":
+                for event_fb_candidate in fb_event_list_or_exc: # fb_event_list_or_exc это List[Event]
+                    if event_fb_candidate.session_id in proposed_session_ids: continue # Не предлагать то, что уже в основном плане
+                    if _is_event_museum(event_fb_candidate):
+                        best_fallback_candidate_for_key_obj = event_fb_candidate
+                        break 
+            elif internal_key_fb == "StandUp":
+                for event_fb_candidate in fb_event_list_or_exc:
+                    if event_fb_candidate.session_id in proposed_session_ids: continue
+                    if _is_event_standup(event_fb_candidate):
+                        best_fallback_candidate_for_key_obj = event_fb_candidate
+                        break
+            # Добавьте elif для других "сложных" категорий для fallback
+            else: # Для "простых" категорий в fallback можно быть менее строгим или просто взять первое
+                # Но лучше все равно какую-то базовую проверку типа сделать, если это важно
+                if fb_event_list_or_exc: # Если есть хоть какие-то результаты
+                    for event_fb_candidate in fb_event_list_or_exc:
+                        if event_fb_candidate.session_id in proposed_session_ids: continue
+                        # Здесь можно добавить проверку, например, что CreationType от API совпадает с ожидаемым для этого internal_key_fb
+                        # Например, если internal_key_fb == "Movie", то event_fb_candidate.actual_api_type == "Movie"
+                        best_fallback_candidate_for_key_obj = event_fb_candidate
+                        logger.info(f"Taking first available for simple fallback key '{internal_key_fb}': {best_fallback_candidate_for_key_obj.name}")
+                        break
+
+            if best_fallback_candidate_for_key_obj:
+                # Убедимся, что этот fallback еще не предлагается и не был отклонен ранее (если есть такая логика)
+                # И что он не конфликтует по времени с уже выбранными events_to_propose (если их >0)
+                # Пока что просто добавляем, если он релевантен по типу.
+                if best_fallback_candidate_for_key_obj.session_id not in proposed_session_ids:
+                    current_fallback_candidates[internal_key_fb] = best_fallback_candidate_for_key_obj
+                    logger.info(f"Found RELEVANT fallback candidate for '{internal_key_fb}': {best_fallback_candidate_for_key_obj.name} on {best_fallback_candidate_for_key_obj.start_time_naive_event_tz.date()}")
+        
+        # Обновляем collected_data_dict только валидными fallback кандидатами
+        if current_fallback_candidates:
+            collected_data_dict["fallback_candidates"] = {
+                key: event.model_dump() for key, event in current_fallback_candidates.items()
+            }
+
+
+    # Определяем, был ли предложен начальный план
+    # План считается предложенным, если есть что показать: либо прямые события, либо релевантные fallback-кандидаты
+    is_initial_plan_now_proposed = bool(events_to_propose) or bool(collected_data_dict.get("fallback_candidates"))
+    
+    # Обновляем список ненайденных интересов: только те, для которых нет ни прямого события, ни fallback
+    final_not_found_keys = []
+    if collected_data_dict.get("not_found_interest_keys_in_primary_search"):
+        for key_not_found_in_primary in collected_data_dict["not_found_interest_keys_in_primary_search"]:
+            is_covered_by_fallback = key_not_found_in_primary in collected_data_dict.get("fallback_candidates", {})
+            is_covered_by_direct = any(event.event_type_key == key_not_found_in_primary for event in events_to_propose)
+            
+            if not is_covered_by_fallback and not is_covered_by_direct:
+                final_not_found_keys.append(key_not_found_in_primary)
+    
+    collected_data_dict["not_found_interest_keys_final"] = final_not_found_keys # Новое поле для error_node
 
     logger.info(
-        f"Proposing {len(events_to_propose)} events from primary. Fallback candidates for: {list(collected_data_dict.get('fallback_candidates', {}).keys())}. Not found in primary & time: {collected_data_dict.get('not_found_interest_keys_in_primary_search')}"
+        f"search_events_node final proposal: {len(events_to_propose)} direct events. "
+        f"Fallback candidates for: {list(collected_data_dict.get('fallback_candidates', {}).keys())}. "
+        f"Interests truly not found (after primary and fallback filters): {final_not_found_keys}"
     )
+    
     return {
-        "current_events": events_to_propose,
-        "is_initial_plan_proposed": bool(events_to_propose)
-        or bool(collected_data_dict.get("fallback_candidates")),
-        "collected_data": collected_data_dict,
+        "current_events": events_to_propose, # Только те, что прошли все фильтры для немедленного предложения
+        "is_initial_plan_proposed": is_initial_plan_now_proposed,
+        "collected_data": collected_data_dict, # С обновленными fallback_candidates и not_found_interest_keys_final
     }
+
 
 
 async def _check_event_compatibility(

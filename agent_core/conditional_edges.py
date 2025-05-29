@@ -101,12 +101,14 @@ def check_initial_data_sufficiency_edge(state: AgentState) -> str:
 def check_event_search_result_edge(state: AgentState) -> str:
     logger.debug("Edge: check_event_search_result_edge evaluating...")
     current_events = state.get("current_events")
+    collected_data = state.get("collected_data", {})
+    fallback_candidates = collected_data.get("fallback_candidates", {})
 
-    if current_events and len(current_events) > 0:
-        logger.info("Edge: Events found. Routing to 'present_initial_plan_node'.")
+    if (current_events and len(current_events) > 0) or fallback_candidates: # <--- ИЗМЕНЕНИЕ ЗДЕСЬ
+        logger.info("Edge: Events or fallback candidates found. Routing to 'present_initial_plan_node'.")
         return "present_initial_plan_node"
     else:
-        logger.info("Edge: No events found. Routing to 'error_node'.")
+        logger.info("Edge: No direct events and no fallback candidates. Routing to 'error_node'.")
         return "error_node"
 
 def check_address_needs_clarification_or_route_exists_edge(state: AgentState) -> str:

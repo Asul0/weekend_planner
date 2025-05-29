@@ -212,7 +212,11 @@ class Event(BaseModel):
     )
     name: str = Field(description="Полное название мероприятия.")
     event_type_key: str = Field(
-        description="Строковый ключ типа мероприятия, соответствующий API Афиши (например, 'Concert', 'Movie')."
+        description="Внутренний ключ запрошенного типа мероприятия (например, 'Movie', 'Museum', 'StandUp')." 
+    )
+    actual_api_type: Optional[str] = Field(
+        default=None, 
+        description="Фактический тип события, полученный из поля 'Type' ответа API Афиши (например, 'Movie', 'Event', 'Admission')."
     )
     place_name: str = Field(description="Название места проведения мероприятия.")
     place_address: Optional[str] = Field(
@@ -253,6 +257,18 @@ class Event(BaseModel):
     age_restriction: Optional[str] = Field(
         default=None,
         description="Возрастное ограничение для мероприятия (например, '18+').",
+    )
+    genres: Optional[List[str]] = Field(
+        default=None, 
+        description="Список жанров мероприятия (из поля 'Genres' объекта Creation API Афиши)."
+    )
+    description: Optional[str] = Field(
+        default=None, 
+        description="Полное описание мероприятия (из поля 'Description' объекта Creation API Афиши)."
+    )
+    short_description: Optional[str] = Field(
+        default=None, 
+        description="Краткое описание мероприятия (из поля 'ShortDescription' объекта Creation API Афиши)."
     )
 
 

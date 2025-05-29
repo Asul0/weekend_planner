@@ -11,16 +11,28 @@ from config.settings import settings  # Используем наш settings
 logger = logging.getLogger(__name__)
 # logging.basicConfig(level=settings.LOG_LEVEL.upper()) # Глобальная настройка
 
-CREATION_TYPES_AFISHA_INTERNAL = {  # Переименовал, чтобы избежать конфликта имен, если CREATION_TYPES есть где-то еще
-    "Concert": "Concert",
-    "Performance": "Performance",
-    "UserEvent": "UserEvent",
-    "Excursion": "Excursion",
+CREATION_TYPES_AFISHA_INTERNAL = {
     "Movie": "Movie",
-    "Event": "Event",
-    "Admission": "Admission",
+    "Performance": "Performance", # Театр, Опера и балет
+    "Concert": "Concert",
     "SportEvent": "SportEvent",
-    "ANY": None,
+    "Excursion": "Excursion",
+    "Event": "Event",             # Фестивали, Вечеринки, Квизы, Лекции, Выставки (как вариант)
+    "Admission": "Admission",     # Музеи, Выставки (как вариант)
+
+    # Наши внутренние ключи, которые мапятся на существующие API типы
+    "Exhibition": "Admission",    # Решили, что выставки будем пробовать через Admission
+    "Festival": "Event",
+    "StandUp": "Concert",
+    "OperaBallet": "Performance", # Уже покрывается Performance
+    "Party": "Event",
+    "Quiz": "Event",
+    "MasterClass": "Event",
+    "Lecture": "Event",
+    
+    "Museum": "Admission",
+
+    "ANY": None, 
 }
 
 
@@ -105,212 +117,205 @@ async def search_sessions_internal(
     city_id: int,
     date_from: date,
     date_to: date,
-    creation_type_key: Optional[str] = "ANY",
+    creation_type_key: Optional[str] = "ANY", # Это наш внутренний ключ ("Movie", "Museum", etc.)
     min_start_time_naive: Optional[datetime] = None,
-    max_start_time_naive: Optional[datetime] = None,  # Новый аргумент
+    max_start_time_naive: Optional[datetime] = None,
     max_budget_per_person: Optional[int] = None,
     exclude_session_ids: Optional[List[int]] = None,
+    # widget_key: Optional[str] = settings.AFISHA_WIDGET_KEY # Если WidgetKey нужен и хранится в settings
 ) -> List[Dict[str, Any]]:
     all_found_sessions: List[Dict[str, Any]] = []
     date_from_str = date_from.isoformat()
     date_to_str = date_to.isoformat()
-    cursor = None
-    actual_creation_type = CREATION_TYPES_AFISHA_INTERNAL.get(creation_type_key)
+    
+    # Получаем API-совместимый тип из нашего словаря CREATION_TYPES_AFISHA_INTERNAL
+    # creation_type_key - это наш внутренний ключ (например, "Museum")
+    # api_type_to_request - это то, что пойдет в API (например, "Admission")
+    api_type_to_request = CREATION_TYPES_AFISHA_INTERNAL.get(creation_type_key if creation_type_key else "ANY")
 
     logger.info(
-        f"Afisha: Searching sessions: city_id={city_id}, date={date_from_str}-{date_to_str}, "
-        f"type_key='{creation_type_key}' (API type: {actual_creation_type}), budget={max_budget_per_person}, "
-        f"min_start={min_start_time_naive.isoformat() if min_start_time_naive else None}, "  # Обновлен лог
-        f"max_start={max_start_time_naive.isoformat() if max_start_time_naive else None}"  # Обновлен лог
+        f"AfishaService: Searching sessions for city_id={city_id}, date_range=[{date_from_str} to {date_to_str}], "
+        f"requested_internal_type_key='{creation_type_key}', API_type_to_request='{api_type_to_request}'. "
+        f"Time constraints: min_start={min_start_time_naive}, max_start={max_start_time_naive}. "
+        f"Budget: {max_budget_per_person}. Exclude IDs: {exclude_session_ids}."
     )
 
-    async with aiohttp.ClientSession() as session:
-        page_count = 0
-        max_pages_to_fetch = 20
+    current_cursor: Optional[str] = None # Курсор для первого запроса отсутствует
+    page_count = 0
+    max_pages_to_fetch = 10 # Ограничение, чтобы не уйти в бесконечный цикл при ошибках API
 
+    async with aiohttp.ClientSession() as session:
         while page_count < max_pages_to_fetch:
             page_count += 1
             creations_params: Dict[str, Any] = {
                 "CityId": city_id,
                 "DateFrom": date_from_str,
                 "DateTo": date_to_str,
-                "Limit": 5,
+                "Limit": 20, # Количество "произведений" (creations) на страницу. Можно увеличить.
+                # "WidgetKey": widget_key, # Раскомментируйте, если WidgetKey обязателен и передается так
             }
-            if actual_creation_type:
-                creations_params["CreationType"] = actual_creation_type
-            if cursor:
-                creations_params["Cursor"] = cursor
+            if api_type_to_request: # Передаем тип, только если он не None (т.е. не "ANY")
+                creations_params["CreationType"] = api_type_to_request
+            if current_cursor: # Для последующих страниц используем полученный курсор
+                creations_params["Cursor"] = current_cursor
 
-            logger.debug(
-                f"Afisha: Fetching creations page {page_count} with params: {creations_params}"
-            )
+            logger.debug(f"AfishaService: Fetching creations page {page_count} with params: {creations_params}")
+            
             creations_data_page = await _make_afisha_request_internal(
                 session, "/v3/creations/page", params=creations_params
             )
 
             if creations_data_page is None or not isinstance(creations_data_page, dict):
-                logger.error(
-                    f"Afisha: Failed to fetch creations page {page_count} for city {city_id}."
-                )
-                break
+                logger.error(f"AfishaService: Failed to fetch creations page {page_count} or invalid format for city {city_id}. Params: {creations_params}")
+                break # Прерываем пагинацию при ошибке получения страницы
 
             creations_on_page = creations_data_page.get("Creations", [])
-            cursor = creations_data_page.get("cursor")
+            api_returned_cursor = creations_data_page.get("cursor") # Курсор из ТЕКУЩЕГО ответа
+
+            logger.debug(f"AfishaService: Page {page_count} response. Creations on page: {len(creations_on_page)}, Cursor from API: '{api_returned_cursor}'")
 
             if not creations_on_page:
-                logger.info(
-                    f"Afisha: No more creations on page {page_count}. Cursor: {cursor}"
-                )
-                if not cursor:
-                    break
-                continue
+                logger.info(f"AfishaService: No creations found on page {page_count} for params {creations_params}.")
+                if not api_returned_cursor: # Если нет ни событий на странице, ни курсора на следующую
+                    logger.info(f"AfishaService: And no further cursor. Stopping pagination.")
+                    break 
+                current_cursor = api_returned_cursor # Обновляем курсор и идем на следующую страницу
+                continue # Переходим к следующей итерации цикла while
 
-            logger.info(
-                f"Afisha: Found {len(creations_on_page)} creations on page {page_count}."
-            )
+            # Обработка найденных "Произведений" (Creations)
             schedule_tasks = []
-            for creation in creations_on_page:
-                creation_id = creation.get("Id")
-                if not creation_id:
+            for creation_item_data in creations_on_page: # creation_item_data - это словарь одного Creation
+                if not isinstance(creation_item_data, dict):
+                    logger.warning(f"AfishaService: Invalid creation item data: {creation_item_data}")
                     continue
-                schedule_params: Dict[str, Any] = {
+                creation_id = creation_item_data.get("Id")
+                if not creation_id:
+                    logger.warning(f"AfishaService: Creation item missing ID: {creation_item_data}")
+                    continue
+                
+                schedule_params_for_creation: Dict[str, Any] = {
                     "CityId": city_id,
                     "DateFrom": date_from_str,
                     "DateTo": date_to_str,
+                    # "WidgetKey": widget_key, # Если нужен для /schedule
                 }
                 task = _make_afisha_request_internal(
                     session,
                     f"/v3/creations/{creation_id}/schedule",
-                    params=schedule_params,
+                    params=schedule_params_for_creation,
                 )
-                schedule_tasks.append((task, creation))
+                schedule_tasks.append((task, creation_item_data)) # Передаем сам словарь creation_item_data
 
-            schedule_results_with_creations = await asyncio.gather(
+            schedule_results_with_creation_data = await asyncio.gather(
                 *(t for t, _ in schedule_tasks), return_exceptions=True
             )
+            
             current_time_utc = datetime.now(timezone.utc)
 
-            for i, schedule_result in enumerate(schedule_results_with_creations):
-                original_creation = schedule_tasks[i][1]
-                if isinstance(schedule_result, Exception):
-                    logger.error(
-                        f"Afisha: Error fetching schedule for creation {original_creation.get('Id')}: {schedule_result}"
-                    )
+            for i, schedule_result_item in enumerate(schedule_results_with_creation_data):
+                original_creation_dict = schedule_tasks[i][1] # Это наш словарь Creation
+                
+                if isinstance(schedule_result_item, Exception):
+                    logger.error(f"AfishaService: Error fetching schedule for creation ID {original_creation_dict.get('Id')}: {schedule_result_item}")
                     continue
 
-                schedule_data_list = schedule_result
-                if not isinstance(schedule_data_list, list):
+                schedule_data_list_for_creation = schedule_result_item # Это список блоков [ {place, sessions}, ... ]
+                if not isinstance(schedule_data_list_for_creation, list):
+                    logger.warning(f"AfishaService: Schedule data for creation ID {original_creation_dict.get('Id')} is not a list: {type(schedule_data_list_for_creation)}. Data: {str(schedule_data_list_for_creation)[:200]}")
                     continue
 
-                for schedule_block in schedule_data_list:
+                # Извлекаем данные из original_creation_dict (один раз для всех его сеансов)
+                actual_event_type_from_api = original_creation_dict.get("Type")
+                creation_genres = original_creation_dict.get("Genres")
+                creation_description = original_creation_dict.get("Description")
+                creation_short_description = original_creation_dict.get("ShortDescription")
+                creation_duration_minutes = original_creation_dict.get("Duration")
+                creation_duration_description = original_creation_dict.get("DurationDescription")
+                creation_rating = original_creation_dict.get("Rating")
+                creation_age_restriction = original_creation_dict.get("AgeRestriction")
+                creation_id_from_object = original_creation_dict.get("Id")
+                creation_name = original_creation_dict.get("Name", "Название не указано")
+
+                for schedule_block in schedule_data_list_for_creation:
+                    if not isinstance(schedule_block, dict): continue
                     place_info = schedule_block.get("Place")
                     sessions_in_block = schedule_block.get("Sessions")
-                    if not place_info or not isinstance(sessions_in_block, list):
+                    if not isinstance(place_info, dict) or not isinstance(sessions_in_block, list):
                         continue
-
+                    
+                    place_name = place_info.get("Name", "Место не указано")
+                    place_address = place_info.get("Address")
                     place_coords_lon: Optional[float] = None
                     place_coords_lat: Optional[float] = None
-                    place_address = place_info.get("Address")
-                    if place_info.get("Coordinates"):
+                    coordinates_data = place_info.get("Coordinates")
+                    if isinstance(coordinates_data, dict):
                         try:
-                            lon, lat = place_info["Coordinates"].get(
-                                "Longitude"
-                            ), place_info["Coordinates"].get("Latitude")
+                            lon = coordinates_data.get("Longitude")
+                            lat = coordinates_data.get("Latitude")
                             if lon is not None and lat is not None:
-                                place_coords_lon, place_coords_lat = float(lon), float(
-                                    lat
-                                )
+                                place_coords_lon, place_coords_lat = float(lon), float(lat)
                         except (ValueError, TypeError):
-                            pass
+                            logger.warning(f"AfishaService: Could not parse coordinates for place '{place_name}': {coordinates_data}")
 
                     for session_info in sessions_in_block:
-                        session_id, session_datetime_str = session_info.get(
-                            "Id"
-                        ), session_info.get("SessionDateTime")
-                        if not session_datetime_str or not session_id:
-                            continue
-                        if exclude_session_ids and session_id in exclude_session_ids:
-                            continue
-
-                        try:
-                            session_dt_aware = datetime.fromisoformat(
-                                session_datetime_str
-                            )
-                            session_dt_naive_event_tz = session_dt_aware.replace(
-                                tzinfo=None
-                            )
-                            current_time_in_event_tz = current_time_utc.astimezone(
-                                session_dt_aware.tzinfo
-                            )
-                            if session_dt_aware <= current_time_in_event_tz:
-                                continue
-                        except ValueError:
-                            continue
-
-                        if (
-                            min_start_time_naive
-                            and session_dt_naive_event_tz < min_start_time_naive
-                        ):
-                            continue
-
-                        # Новая фильтрация по max_start_time_naive
-                        if (
-                            max_start_time_naive
-                            and session_dt_naive_event_tz > max_start_time_naive
-                        ):
-                            logger.debug(
-                                f"Afisha: Filtering out session {session_id} by max_start_time_naive. Session: {session_dt_naive_event_tz}, Max: {max_start_time_naive}"
-                            )
-                            continue
-
+                        if not isinstance(session_info, dict): continue
+                        session_id = session_info.get("Id")
+                        session_datetime_str = session_info.get("SessionDateTime")
                         min_price = session_info.get("MinPrice")
-                        if (
-                            max_budget_per_person is not None
-                            and min_price is not None
-                            and min_price > max_budget_per_person
-                        ):
+
+                        if not session_datetime_str or not session_id: continue
+                        if exclude_session_ids and session_id in exclude_session_ids: continue
+                        
+                        try:
+                            session_dt_aware = datetime.fromisoformat(session_datetime_str)
+                            session_dt_naive_event_tz = session_dt_aware.replace(tzinfo=None)
+                            # Сравниваем с текущим временем в том же часовом поясе, что и событие
+                            current_time_in_event_tz = current_time_utc.astimezone(session_dt_aware.tzinfo).replace(tzinfo=None)
+                            if session_dt_naive_event_tz <= current_time_in_event_tz:
+                                continue
+                        except ValueError as ve_date:
+                            logger.warning(f"AfishaService: Error parsing session datetime '{session_datetime_str}': {ve_date}")
                             continue
-
-                        all_found_sessions.append(
-                            {
-                                "session_id": session_id,
-                                "afisha_id": original_creation.get("Id"),
-                                "event_type_key": creation_type_key,
-                                "name": original_creation.get(
-                                    "Name", "Название не указано"
-                                ),
-                                "place_name": place_info.get(
-                                    "Name", "Место не указано"
-                                ),
-                                "place_address": place_address,
-                                "place_coords_lon": place_coords_lon,
-                                "place_coords_lat": place_coords_lat,
-                                "start_time_iso": session_datetime_str,
-                                "start_time_naive_event_tz": session_dt_naive_event_tz,
-                                "duration_minutes": original_creation.get("Duration"),
-                                "duration_description": original_creation.get(
-                                    "DurationDescription"
-                                ),
-                                "min_price": min_price,
-                                "price_text": (
-                                    f"{int(min_price)} ₽"
-                                    if min_price is not None
-                                    else "Цена неизвестна"
-                                ),
-                                "rating": original_creation.get("Rating"),
-                                "age_restriction": original_creation.get(
-                                    "AgeRestriction"
-                                ),
-                            }
-                        )
-            if not cursor:
-                logger.info(
-                    "Afisha: No more cursor from /page, finished fetching creations."
-                )
-                break
-
-        all_found_sessions.sort(key=lambda s: s["start_time_naive_event_tz"])
-        logger.info(
-            f"Afisha: Total sessions found and filtered: {len(all_found_sessions)}"
-        )
-        return all_found_sessions
+                        
+                        if min_start_time_naive and session_dt_naive_event_tz < min_start_time_naive: continue
+                        if max_start_time_naive and session_dt_naive_event_tz > max_start_time_naive: continue
+                        if max_budget_per_person is not None and min_price is not None:
+                            try:
+                                if float(min_price) > max_budget_per_person: continue
+                            except ValueError:
+                                logger.warning(f"AfishaService: Could not parse min_price '{min_price}' to float.")
+                        
+                        all_found_sessions.append({
+                            "session_id": session_id,
+                            "afisha_id": creation_id_from_object,
+                            "event_type_key": creation_type_key, # Наш внутренний ключ ("Museum", "StandUp")
+                            "actual_api_type": actual_event_type_from_api, # Фактический тип от API
+                            "name": creation_name,
+                            "place_name": place_name,
+                            "place_address": place_address,
+                            "place_coords_lon": place_coords_lon,
+                            "place_coords_lat": place_coords_lat,
+                            "start_time_iso": session_datetime_str,
+                            "start_time_naive_event_tz": session_dt_naive_event_tz,
+                            "duration_minutes": creation_duration_minutes,
+                            "duration_description": creation_duration_description,
+                            "min_price": int(min_price) if min_price is not None else None,
+                            "price_text": (f"от {int(min_price)} ₽" if min_price is not None else None), # Уточнил формат
+                            "rating": creation_rating,
+                            "age_restriction": creation_age_restriction,
+                            "genres": creation_genres,
+                            "description": creation_description,
+                            "short_description": creation_short_description,
+                        })
+            
+            # После обработки всех "произведений" на текущей странице,
+            # обновляем курсор для следующего запроса в цикле while.
+            if not api_returned_cursor: 
+                logger.info("AfishaService: No cursor returned by API on current page, assuming end of pagination.")
+                break 
+            current_cursor = api_returned_cursor
+        
+    # Сортировка всех найденных сеансов по времени начала
+    all_found_sessions.sort(key=lambda s: s["start_time_naive_event_tz"])
+    logger.info(f"AfishaService: Total sessions found and pre-filtered for internal key '{creation_type_key}' after all pages: {len(all_found_sessions)}")
+    return all_found_sessions
