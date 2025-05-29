@@ -1,3 +1,6 @@
+# Файл: schemas/data_schemas.py
+# (Предполагаем, что остальные импорты и классы остаются как есть)
+# ...
 from typing import Optional, List, Tuple, Dict, Any
 from pydantic import BaseModel, Field, validator
 from datetime import datetime
@@ -120,6 +123,10 @@ class EventSearchToolArgs(BaseModel):
     city_id: int = Field(
         description="Числовой ID города (согласно API Афиши) для поиска мероприятий."
     )
+    city_name: Optional[str] = Field( # <--- НОВОЕ ПОЛЕ
+        default=None,
+        description="Название города (например, 'Воронеж') для дополнительной фильтрации по адресу."
+    )
     date_from: datetime = Field(
         description="Дата и время начала периода поиска мероприятий (объект datetime). Фактически используется как дата начала дня."
     )
@@ -137,7 +144,7 @@ class EventSearchToolArgs(BaseModel):
     max_start_time_naive: Optional[datetime] = Field(
         default=None,
         description="Максимальное ВРЕМЯ НАЧАЛА мероприятия (наивное, без таймзоны, объект datetime) для фильтрации. Мероприятие должно НАЧАТЬСЯ не позже этого времени.",
-    )  # НОВОЕ
+    )
     max_budget_per_person: Optional[int] = Field(
         default=None,
         description="Максимальный бюджет на одного человека в рублях для фильтрации мероприятий по цене.",
@@ -145,7 +152,7 @@ class EventSearchToolArgs(BaseModel):
     time_constraints_for_next_event: Optional[Dict[str, datetime]] = Field(
         default=None,
         description="Словарь с временными ограничениями для следующего мероприятия...",
-    )  # остается
+    )
     exclude_session_ids: Optional[List[int]] = Field(
         default=None,
         description="Список числовых ID сессий мероприятий, которые нужно исключить из результатов поиска.",
@@ -309,11 +316,11 @@ class ParsedDateTime(BaseModel):
     end_hour: Optional[int] = Field(
         default=None,
         description="Извлеченный час КОНЦА временного диапазона (число от 0 до 23), если указан.",
-    )  # НОВОЕ
+    )
     end_minute: Optional[int] = Field(
         default=None,
         description="Извлеченная минута КОНЦА временного диапазона (число от 0 до 59), если указана.",
-    )  # НОВОЕ
+    )
 
     is_ambiguous: bool = Field(
         default=False,
@@ -341,33 +348,6 @@ class AnalyzedFeedback(BaseModel):
     )
 
 
-
-    city_name: Optional[str] = None
-    city_id_afisha: Optional[int] = None
-    interests_original: Optional[List[str]] = None
-    interests_keys_afisha: Optional[List[str]] = None
-    budget_original: Optional[int] = None
-    budget_current_search: Optional[int] = None
-    dates_description_original: Optional[str] = None
-    raw_time_description_original: Optional[str] = None
-    parsed_dates_iso: Optional[List[str]] = None
-    parsed_end_dates_iso: Optional[List[str]] = None
-    user_start_address_original: Optional[str] = None
-    user_start_address_validated_coords: Optional[Dict[str, float]] = None
-    partial_address_street: Optional[str] = Field(default=None, description="Частично распознанная улица, ожидается номер дома.")
-    awaiting_address_input: bool = False
-    awaiting_fallback_confirmation: bool = False
-    pending_fallback_event: Optional[Dict[str, Any]] = None
-    not_found_interest_keys: Optional[List[str]] = None
-    fallback_candidates: Optional[Dict[str, Dict[str, Any]]] = None
-    fallback_accepted_and_plan_updated: bool = False
-    clarification_needed_fields: Optional[List[str]] = Field(default_factory=list)
-    previous_confirmed_collected_data: Optional[Dict[str, Any]] = None
-    previous_confirmed_events: Optional[List[Dict[str, Any]]] = None
-    user_time_desc_for_fallback: Optional[str] = None
-
-
-
 class CollectedUserData(BaseModel): # У тебя это уже BaseModel
     city_name: Optional[str] = None
     city_id_afisha: Optional[int] = None
@@ -392,7 +372,9 @@ class CollectedUserData(BaseModel): # У тебя это уже BaseModel
     clarification_needed_fields: Optional[List[str]] = Field(default_factory=list)
     previous_confirmed_collected_data: Optional[Dict[str, Any]] = None 
     previous_confirmed_events: Optional[List[Dict[str, Any]]] = None
-    user_time_desc_for_fallback: Optional[str] = None # Это поле кажется специфичным, возможно, его можно убрать или переосмыслить
+    user_time_desc_for_fallback: Optional[str] = None 
+    search_errors_by_interest: Optional[Dict[str, str]] = None # <--- Добавлено для полноты, если используется в collected_data
     
     class Config:
-        extra = "allow" # Оставляем, если нужна гибкость, но лучше все поля объявлять
+        extra = "allow" 
+# ... (остальные схемы)

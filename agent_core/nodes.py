@@ -883,6 +883,7 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
     collected_data_dict: dict = dict(state.get("collected_data", {}))
 
     city_id = collected_data_dict.get("city_id_afisha")
+    city_name_for_filter = collected_data_dict.get("city_name") # <--- ПОЛУЧАЕМ ИМЯ ГОРОДА
     parsed_dates_iso_list = collected_data_dict.get("parsed_dates_iso")
     interests_keys: List[str] = list(
         collected_data_dict.get("interests_keys_afisha", [])
@@ -890,7 +891,10 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
     budget = collected_data_dict.get("budget_current_search")
 
     candidate_events_by_interest: Dict[str, List[Event]] = {}
-    search_errors_by_interest: Dict[str, str] = {}
+    # search_errors_by_interest теперь часть collected_data_dict, если вы так решили в AgentState
+    # или можно оставить локальной переменной и потом обновить collected_data_dict
+    search_errors_by_interest: Dict[str, str] = collected_data_dict.get("search_errors_by_interest", {})
+
 
     if not city_id or not parsed_dates_iso_list or not interests_keys:
         logger.warning(
@@ -900,9 +904,10 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
             search_errors_by_interest[interest_key] = (
                 "Отсутствуют критические данные для поиска (город, дата или интересы)."
             )
+        collected_data_dict["search_errors_by_interest"] = search_errors_by_interest
         return {
             "candidate_events_by_interest": candidate_events_by_interest,
-            "search_errors_by_interest": search_errors_by_interest,
+            # "search_errors_by_interest": search_errors_by_interest, # Уже в collected_data
             "collected_data": collected_data_dict,
         }
 
@@ -933,9 +938,10 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
         )
         for interest_key in interests_keys:
             search_errors_by_interest[interest_key] = f"Ошибка обработки дат: {e_date}"
+        collected_data_dict["search_errors_by_interest"] = search_errors_by_interest
         return {
             "candidate_events_by_interest": candidate_events_by_interest,
-            "search_errors_by_interest": search_errors_by_interest,
+            # "search_errors_by_interest": search_errors_by_interest,
             "collected_data": collected_data_dict,
         }
 
@@ -943,14 +949,16 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
     for interest_key in interests_keys:
         tool_args = EventSearchToolArgs(
             city_id=city_id,
+            city_name=city_name_for_filter, # <--- ПЕРЕДАЕМ ИМЯ ГОРОДА
             date_from=base_date_from_dt,
             date_to=api_date_to_dt,
             interests_keys=[interest_key],
             min_start_time_naive=search_min_start_time_naive,
             max_start_time_naive=search_max_start_time_naive,
             max_budget_per_person=budget,
-            exclude_session_ids=None,
+            exclude_session_ids=None, # Можно добавить сюда логику по exclude, если нужно
         )
+        logger.debug(f"Gather candidates: Invoking event_search_tool for interest '{interest_key}' with args: {tool_args.model_dump_json(indent=2)}")
         search_tasks.append(
             event_search_tool.ainvoke(tool_args.model_dump(exclude_none=True))
         )
@@ -962,7 +970,7 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
         if isinstance(result_item, Exception):
             logger.error(
                 f"gather_all_candidate_events_node: Error searching for interest '{interest_key}': {result_item}",
-                exc_info=True,
+                exc_info=True, # Было True, сохраняем
             )
             search_errors_by_interest[interest_key] = (
                 f"Ошибка API при поиске: {result_item}"
@@ -975,6 +983,7 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
             for event_data_dict in result_item:
                 try:
                     event_obj = Event(**event_data_dict)
+                    # Дополнительная проверка на координаты (если нужна перед передачей в конструктор цепочек)
                     if (
                         event_obj.place_coords_lon is None
                         or event_obj.place_coords_lat is None
@@ -984,50 +993,49 @@ async def gather_all_candidate_events_node(state: AgentState) -> Dict[str, Any]:
                         )
                     ):
                         logger.debug(
-                            f"Gather candidates: Skipping event {event_obj.name} for interest {interest_key} due to invalid/missing coordinates."
+                            f"Gather candidates: Skipping event {event_obj.name} for interest {interest_key} due to invalid/missing coordinates after tool call."
                         )
                         continue
-
+                    
+                    # Дополнительная проверка по времени окончания, если user_max_overall_end_dt_naive задан
                     if (
-                        user_max_overall_end_dt_naive
+                        user_max_overall_end_dt_naive 
                         and event_obj.duration_minutes is not None
                     ):
                         event_end_time_naive = (
-                            event_obj.start_time_naive_event_tz
+                            event_obj.start_time_naive_event_tz 
                             + timedelta(minutes=event_obj.duration_minutes)
                         )
                         if event_end_time_naive > user_max_overall_end_dt_naive:
                             logger.debug(
-                                f"Gather candidates: Event {event_obj.name} ends too late ({event_end_time_naive}), skipping."
+                                f"Gather candidates node: Event {event_obj.name} ends too late ({event_end_time_naive}), skipping."
                             )
                             continue
-                    elif (
-                        user_max_overall_end_dt_naive
-                        and event_obj.duration_minutes is None
+                    elif ( # Если длительность неизвестна, но событие НАЧИНАЕТСЯ позже максимально допустимого времени ОКОНЧАНИЯ
+                        user_max_overall_end_dt_naive 
+                        and event_obj.duration_minutes is None 
+                        and event_obj.start_time_naive_event_tz > user_max_overall_end_dt_naive
                     ):
-                        if (
-                            event_obj.start_time_naive_event_tz
-                            > user_max_overall_end_dt_naive
-                        ):
-                            logger.debug(
-                                f"Gather candidates: Event {event_obj.name} starts too late ({event_obj.start_time_naive_event_tz}), skipping (unknown duration)."
+                         logger.debug(
+                                f"Gather candidates node: Event {event_obj.name} starts too late ({event_obj.start_time_naive_event_tz}) with unknown duration, skipping."
                             )
-                            continue
+                         continue
+
                     valid_events_for_interest.append(event_obj)
                 except ValidationError as ve:
                     logger.warning(
                         f"gather_all_candidate_events_node: Validation error for event data for '{interest_key}': {ve}"
                     )
-
+            
             candidate_events_by_interest[interest_key] = sorted(
                 valid_events_for_interest, key=lambda e: e.start_time_naive_event_tz
             )
-            if not valid_events_for_interest:
+            if not valid_events_for_interest and interest_key not in search_errors_by_interest: # Если не было ошибки API, но список пуст
                 search_errors_by_interest[interest_key] = (
-                    "Мероприятия не найдены по указанным критериям."
+                    "Мероприятия не найдены по указанным критериям (включая фильтр по городу и времени)."
                 )
             logger.info(
-                f"gather_all_candidate_events_node: Found {len(valid_events_for_interest)} valid candidates for interest '{interest_key}'."
+                f"gather_all_candidate_events_node: Stored {len(valid_events_for_interest)} valid candidates for interest '{interest_key}'."
             )
         else:
             logger.error(
